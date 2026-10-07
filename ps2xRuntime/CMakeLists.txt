@@ -437,9 +437,23 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
-file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
-)
+# Build the runner straight from ps2_recomp's output folder instead of copying
+# generated code into src/runner and include/.
+set(PS2X_GENERATED_DIR "" CACHE PATH "ps2_recomp output folder to build ps2EntryRunner from (empty = src/runner)")
+
+if(PS2X_GENERATED_DIR)
+    if(NOT EXISTS "${PS2X_GENERATED_DIR}/register_functions.cpp")
+        message(FATAL_ERROR "PS2X_GENERATED_DIR has no register_functions.cpp: ${PS2X_GENERATED_DIR}")
+    endif()
+    file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS "${PS2X_GENERATED_DIR}/*.cpp")
+    set(PS2X_GENERATED_INCLUDE_DIR "${PS2X_GENERATED_DIR}")
+    message(STATUS "ps2EntryRunner: ${PS2X_GENERATED_DIR}")
+else()
+    file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
+    )
+    set(PS2X_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+endif()
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
@@ -476,8 +490,8 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        "${PS2X_GENERATED_INCLUDE_DIR}/ps2_recompiled_functions.h"
+        "${PS2X_GENERATED_INCLUDE_DIR}/ps2_recompiled_stubs.h")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()
@@ -499,6 +513,12 @@ endif()
 
 if(MSVC)
     target_compile_options(ps2EntryRunner PRIVATE /FS)
+    # The VS generator compiles one target's sources serially without /MP;
+    # the runner is one target with thousands of generated files.
+    # Ninja already runs one cl.exe per source, so only add it there.
+    if(CMAKE_GENERATOR MATCHES "Visual Studio")
+        target_compile_options(ps2EntryRunner PRIVATE /MP)
+    endif()
 endif()
 
 target_include_directories(ps2_runtime PUBLIC
@@ -511,6 +531,11 @@ target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
 )
+
+if(PS2X_GENERATED_DIR)
+    # BEFORE so the generated headers win over any stale copies in include/
+    target_include_directories(ps2EntryRunner BEFORE PRIVATE "${PS2X_GENERATED_DIR}")
+endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
