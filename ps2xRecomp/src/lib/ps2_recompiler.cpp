@@ -1902,6 +1902,13 @@ namespace ps2recomp
             return;
         }
 
+        std::unordered_set<uint32_t> knownFunctionStarts;
+        knownFunctionStarts.reserve(m_functions.size());
+        for (const auto &function : m_functions)
+        {
+            knownFunctionStarts.insert(function.start);
+        }
+
         std::unordered_set<uint32_t> guestFallbackEntryAddresses = m_entryPointHintStarts;
         for (uint32_t address : m_stubFunctionStarts)
         {
@@ -1910,6 +1917,17 @@ namespace ps2recomp
                 resolveStubTarget(bindingIt->second) == StubTarget::Unknown)
             {
                 guestFallbackEntryAddresses.insert(address);
+            }
+            else if (!knownFunctionStarts.contains(address))
+            {
+                // A known handler bound to an address the function map missed:
+                // without a function there the binding is silently dropped and
+                // calls hit a missing target at runtime.
+                guestFallbackEntryAddresses.insert(address);
+                std::ostringstream msg;
+                msg << "stub binding '" << bindingIt->second << "' at 0x" << std::hex << address
+                    << " has no function in the map; synthesizing one";
+                m_reporter.warning("config", msg.str());
             }
         }
 
@@ -1956,6 +1974,20 @@ namespace ps2recomp
                 msg << "synthesized " << configuredStats.discoveredCount
                     << " standalone configured guest entry point(s)";
                 m_reporter.progress(msg.str());
+            }
+
+            // The stub pass ran before these existed; apply it to synthesized
+            // functions that land on a bound stub so they become handler wrappers
+            // instead of recompiled guest code.
+            for (auto &function : m_functions)
+            {
+                if (!function.isStub && standaloneEntryAddresses.contains(function.start) &&
+                    isStubFunction(function) && hasResolvedStubHandler(function))
+                {
+                    function.isStub = true;
+                    function.isSkipped = false;
+                    m_reporter.recordFunctionStubbed();
+                }
             }
         }
 
