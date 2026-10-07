@@ -39,6 +39,15 @@ were not present in the sampled games, and ambiguous matches are intentionally i
 4. Run the recompiler with that exported TOML.
 5. The recompiler will prioritize Ghidra's boundaries over its own heuristics.
 
+Headless (no GUI): pass the output paths as script arguments. The CSV defaults to `<name>_functions.csv` beside the TOML.
+
+```bash
+analyzeHeadless <project_dir> <project_name> -import game.elf -processor r5900:LE:32:default \
+  -scriptPath ps2xRecomp/tools/ghidra -postScript ExportPS2Functions.java out/config.toml [out/map.csv]
+```
+
+The `r5900:LE:32:default` language comes from the [ghidra-emotionengine-reloaded](https://github.com/chaoticgd/ghidra-emotionengine-reloaded) extension.
+
 ## Key Features
 
 * Analyzes PS2 ELF binaries to extract symbols, functions, and structure
