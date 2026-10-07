@@ -1142,6 +1142,24 @@ int main()
     if (!expect(!emittedUnhandledSeek,
                 "sceCdSeek still emitted an unhandled IOP import")) return 1;
 
+    {
+        // sceSifLoadModuleBuffer passes an IOP address: games DMA the IRX into
+        // IOP RAM first. 0x1F0000 is past the end of this host's EE memory, so
+        // only the IOP RAM path can satisfy the load.
+        TestHost iopRamHost(0x20000u);
+        IopSubsystem iopRamIop(iopRamHost);
+        writeMinimalIrx(iopRamHost, 0x100u);
+        std::vector<uint8_t> irx(0x400u);
+        if (!expect(iopRamHost.readGuest(0x100u, irx.data(), irx.size()),
+                    "Could not read the staged IRX image")) return 1;
+        constexpr uint32_t iopBufferAddress = 0x001F0000u;
+        if (!expect(iopRamIop.writeMemory(iopBufferAddress, irx.data(), irx.size()),
+                    "Could not stage the IRX in IOP RAM")) return 1;
+        const ModuleLoadResult iopRamModule = iopRamIop.loadModuleBuffer(iopBufferAddress);
+        if (!expect(iopRamModule.handled && iopRamModule.moduleId > 0 && iopRamModule.startResult == 7,
+                    "IRX staged in IOP RAM did not load from its IOP address")) return 1;
+    }
+
     std::cout << "ps2xIOP emulator smoke tests passed\n";
     return 0;
 }
