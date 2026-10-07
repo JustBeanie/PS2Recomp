@@ -280,6 +280,15 @@ namespace ps2x::iop::detail
                 cpu.gpr[2] = kCdvdReadyComplete;
                 return true;
 
+            case 14: // sceCdTrayReq(mode, u32 *traycnt)
+                // The emulated disc is never swapped: open/close are no-ops and a
+                // check (mode 2) reports no tray movement since the last call.
+                // Games poll this to detect disc changes and retry while it fails.
+                if (a1 != 0u)
+                    memory.write32(a1, 0u);
+                cpu.gpr[2] = 1u;
+                return true;
+
             case 28: // sceCdStatus
                 cpu.gpr[2] = kCdvdStatusPause;
                 return true;

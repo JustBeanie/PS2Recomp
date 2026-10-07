@@ -883,6 +883,52 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
     }
 
+    // Module start returns sceCdTrayReq(2 /* check */, (u32 *)0x101C0); the
+    // word at 0x101C0 starts as a sentinel so the test sees whether it was written.
+    void writeCdvdTrayReqIrx(TestHost &host, uint32_t address)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t importTableAddress = loadAddress + 0x100u;
+        constexpr uint32_t trayStub = importTableAddress + 20u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
+        program.filesz = 0x200u; program.memsz = 0x200u; program.flags = 7u; program.align = 4u;
+
+        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
+        const uint32_t entry[] = {
+            0x27BDFFF0u, 0xAFBF000Cu,
+            0x24040002u,              // a0 = 2 (SCECdTrayCheck)
+            0x3C050001u, 0x34A501C0u, // a1 = 0x101C0
+            jal(trayStub), 0x00000000u,
+            0x8FBF000Cu, 0x27BD0010u, 0x03E00008u, 0x00000000u,
+        };
+        const uint32_t imports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x64766463u, 0x006E616Du, // "cdvdman"
+            0x03E00008u, 0x2400000Eu, // sceCdTrayReq
+            0u, 0u,
+        };
+        constexpr uint32_t sentinel = 0xDEADBEEFu;
+
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        std::memcpy(segment.data(), entry, sizeof(entry));
+        std::memcpy(segment.data() + 0x100u, imports, sizeof(imports));
+        std::memcpy(segment.data() + 0x1C0u, &sentinel, sizeof(sentinel));
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+    }
+
     bool expect(bool value, const char *message)
     {
         if (!value)
@@ -1158,6 +1204,25 @@ int main()
         const ModuleLoadResult iopRamModule = iopRamIop.loadModuleBuffer(iopBufferAddress);
         if (!expect(iopRamModule.handled && iopRamModule.moduleId > 0 && iopRamModule.startResult == 7,
                     "IRX staged in IOP RAM did not load from its IOP address")) return 1;
+    }
+
+    {
+        TestHost trayHost(0x20000u);
+        IopSubsystem trayIop(trayHost);
+        writeCdvdTrayReqIrx(trayHost, 0x100u);
+        const ModuleLoadResult trayReq = trayIop.loadModuleBuffer(0x100u);
+        uint32_t trayCount = 0xFFFFFFFFu;
+        if (!expect(trayIop.readMemory(0x000101C0u, &trayCount, sizeof(trayCount)),
+                    "Could not read the sceCdTrayReq result")) return 1;
+        if (!expect(trayReq.handled && trayReq.startResult == 1,
+                    "sceCdTrayReq check must succeed")) return 1;
+        if (!expect(trayCount == 0u,
+                    "sceCdTrayReq check must report no tray movement")) return 1;
+        const bool unhandledTray = std::any_of(
+            trayHost.logs.begin(), trayHost.logs.end(),
+            [](const std::string &message)
+            { return message.find("unhandled import cdvdman:14") != std::string::npos; });
+        if (!expect(!unhandledTray, "sceCdTrayReq still emitted an unhandled IOP import")) return 1;
     }
 
     std::cout << "ps2xIOP emulator smoke tests passed\n";
