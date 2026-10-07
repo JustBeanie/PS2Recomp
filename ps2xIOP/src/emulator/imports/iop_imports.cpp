@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <sstream>
 #include <utility>
 
 namespace ps2x::iop::detail
@@ -160,6 +161,30 @@ namespace ps2x::iop::detail
         if (!found || ordinal >= found->functions.size())
             return 0u;
         return found->functions[ordinal];
+    }
+
+    std::string IopImportRegistry::describeMiss(std::string_view library, uint16_t ordinal, std::optional<uint16_t> version) const
+    {
+        std::ostringstream out;
+        out << std::hex;
+        if (const ExportLibrary *found = findLibrary(library, version))
+        {
+            out << "ordinal " << std::dec << ordinal << " past export table @0x" << std::hex << found->tableAddress
+                << " v0x" << found->version << " with " << std::dec << found->functions.size() << " entries";
+            return out.str();
+        }
+        bool any = false;
+        for (const auto &[address, entry] : m_libraries)
+        {
+            if (!equalsIgnoreCase(entry.name, library))
+                continue;
+            out << (any ? ", " : "no major-version match; registered: ") << "v0x" << entry.version
+                << "@0x" << address << " (" << std::dec << entry.functions.size() << " entries)" << std::hex;
+            any = true;
+        }
+        if (!any)
+            out << "no export table registered under that name (" << std::dec << m_libraries.size() << " libraries registered)";
+        return out.str();
     }
 
     int32_t IopImportRegistry::setRebootTimeLibraryHandlingMode(uint32_t address, uint32_t mode)

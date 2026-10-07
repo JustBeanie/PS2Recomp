@@ -352,7 +352,8 @@ namespace ps2x::iop::detail
 
             std::ostringstream out;
             out << "[IOP] unhandled import " << call.library << ':' << call.ordinal
-                << " version=0x" << std::hex << call.version << " pc=0x" << cpu.pc;
+                << " version=0x" << std::hex << call.version << " pc=0x" << cpu.pc
+                << " (" << imports.describeMiss(call.library, call.ordinal, call.version) << ')';
             log(LogLevel::Warning, out.str());
             setV0(0);
             return ImportDisposition::Missing;

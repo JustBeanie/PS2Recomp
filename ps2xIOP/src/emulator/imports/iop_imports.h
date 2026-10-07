@@ -30,6 +30,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool releaseExportTable(uint32_t address);
         [[nodiscard]] uint32_t findTable(std::string_view library, std::optional<uint16_t> version = std::nullopt) const;
         [[nodiscard]] uint32_t resolve(std::string_view library, uint16_t ordinal, std::optional<uint16_t> version = std::nullopt) const;
+        // Why resolve() failed: no such library, version mismatch, or ordinal past the table.
+        [[nodiscard]] std::string describeMiss(std::string_view library, uint16_t ordinal, std::optional<uint16_t> version) const;
         [[nodiscard]] int32_t setRebootTimeLibraryHandlingMode(uint32_t address, uint32_t mode);
         void eraseRange(uint32_t base, uint32_t size);
 
