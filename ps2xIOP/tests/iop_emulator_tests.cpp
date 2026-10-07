@@ -929,6 +929,51 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
     }
 
+    // Module start allocates a 16-byte block (leaving the heap cursor off any
+    // 256-byte boundary), then a 256-byte block, and returns the second address.
+    void writeSysmemAlignIrx(TestHost &host, uint32_t address)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t importTableAddress = loadAddress + 0x100u;
+        constexpr uint32_t allocStub = importTableAddress + 20u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
+        program.filesz = 0x200u; program.memsz = 0x200u; program.flags = 7u; program.align = 4u;
+
+        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
+        const uint32_t entry[] = {
+            0x27BDFFF0u, 0xAFBF000Cu,
+            0x00002021u, 0x24050010u, 0x00003021u, // AllocSysMemory(0, 0x10, 0)
+            jal(allocStub), 0x00000000u,
+            0x00002021u, 0x24050100u, 0x00003021u, // AllocSysMemory(0, 0x100, 0)
+            jal(allocStub), 0x00000000u,
+            0x8FBF000Cu, 0x27BD0010u, 0x03E00008u, 0x00000000u,
+        };
+        const uint32_t imports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x6D737973u, 0x00006D65u, // "sysmem"
+            0x03E00008u, 0x24000004u, // AllocSysMemory
+            0u, 0u,
+        };
+
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        std::memcpy(segment.data(), entry, sizeof(entry));
+        std::memcpy(segment.data() + 0x100u, imports, sizeof(imports));
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+    }
+
     bool expect(bool value, const char *message)
     {
         if (!value)
@@ -1223,6 +1268,16 @@ int main()
             [](const std::string &message)
             { return message.find("unhandled import cdvdman:14") != std::string::npos; });
         if (!expect(!unhandledTray, "sceCdTrayReq still emitted an unhandled IOP import")) return 1;
+    }
+
+    {
+        TestHost sysmemHost(0x20000u);
+        IopSubsystem sysmemIop(sysmemHost);
+        writeSysmemAlignIrx(sysmemHost, 0x100u);
+        const ModuleLoadResult aligned = sysmemIop.loadModuleBuffer(0x100u);
+        const uint32_t block = static_cast<uint32_t>(aligned.startResult);
+        if (!expect(aligned.handled && block != 0u, "AllocSysMemory returned no block")) return 1;
+        if (!expect((block & 0xFFu) == 0u, "AllocSysMemory blocks must be 256-byte aligned")) return 1;
     }
 
     std::cout << "ps2xIOP emulator smoke tests passed\n";

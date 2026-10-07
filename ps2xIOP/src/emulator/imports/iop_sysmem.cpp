@@ -27,9 +27,14 @@ namespace ps2x::iop::detail
         {
         case 4: // AllocSysMemory
         {
+            // SYSMEM manages RAM in 256-byte blocks, so every block it returns is
+            // 256-byte aligned. Drivers depend on it: usbd puts the OHCI HCCA
+            // (which must be 256-aligned) in its block and frees it and exits
+            // when the address is misaligned.
+            constexpr uint32_t kSysmemBlockAlign = 256u;
             const uint32_t address = a0 == 2u
                                          ? m_memory.allocate(a1, 16u, a2)
-                                         : m_memory.allocate(a1, 16u);
+                                         : m_memory.allocate(a1, kSysmemBlockAlign);
             setV0(address);
             return true;
         }
