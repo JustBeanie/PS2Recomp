@@ -31,6 +31,7 @@ namespace ps2x::iop::detail
         std::fill(m_owned.begin(), m_owned.end(), uint8_t{0});
         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
         m_hardware.clear();
+        m_ohci.reset();
         m_allocations.clear();
         m_heapCursor = HeapBase;
         m_interruptStatus = 0;
@@ -213,6 +214,8 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
+        if (IopOhci::contains(address))
+            return m_ohci.read32(address);
         const auto value = m_hardware.find(address);
         if (value != m_hardware.end())
             return value->second;
@@ -231,6 +234,11 @@ namespace ps2x::iop::detail
 
     void IopMemory::writeHardware32(uint32_t address, uint32_t value)
     {
+        if (IopOhci::contains(address))
+        {
+            m_ohci.write32(address, value);
+            return;
+        }
         switch (address)
         {
         case 0x1F801070u:

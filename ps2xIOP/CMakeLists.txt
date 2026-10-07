@@ -12,6 +12,7 @@ add_library(ps2_iop STATIC
     src/emulator/core/iop_cpu.cpp
     src/emulator/core/iop_kernel.cpp
     src/emulator/core/iop_memory.cpp
+    src/emulator/core/iop_ohci.cpp
     src/emulator/services/iop_module_loader.cpp
     src/emulator/services/iop_rpc.cpp
     src/emulator/imports/iop_cdvd.cpp
@@ -57,7 +58,12 @@ if(PS2X_IOP_BUILD_TESTS)
     target_link_libraries(ps2_iop_compatibility_tests PRIVATE ps2_iop)
     add_test(NAME ps2_iop_compatibility_tests COMMAND ps2_iop_compatibility_tests)
 
-    add_executable(ps2_iop_import_version_tests tests/iop_import_version_tests.cpp)
+    add_executable(ps2_iop_ohci_tests tests/iop_ohci_tests.cpp)
+target_link_libraries(ps2_iop_ohci_tests PRIVATE ps2_iop)
+target_include_directories(ps2_iop_ohci_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME ps2_iop_ohci_tests COMMAND ps2_iop_ohci_tests)
+
+add_executable(ps2_iop_import_version_tests tests/iop_import_version_tests.cpp)
     target_link_libraries(ps2_iop_import_version_tests PRIVATE ps2_iop)
     target_include_directories(ps2_iop_import_version_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME ps2_iop_import_version_tests COMMAND ps2_iop_import_version_tests)

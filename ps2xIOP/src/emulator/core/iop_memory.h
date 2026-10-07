@@ -1,5 +1,7 @@
 #pragma once
 
+#include "iop_ohci.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -81,6 +83,7 @@ namespace ps2x::iop::detail
         std::vector<uint8_t> m_owned;
         std::vector<uint8_t> m_scratch;
         std::unordered_map<uint32_t, uint32_t> m_hardware;
+        IopOhci m_ohci;
         std::vector<Allocation> m_allocations;
         uint32_t m_heapCursor = HeapBase;
         uint32_t m_interruptStatus = 0;
