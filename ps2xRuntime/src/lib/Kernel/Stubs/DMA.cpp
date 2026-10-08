@@ -155,19 +155,48 @@ namespace ps2_stubs
         setReturnU32(ctx, oldAddr);
     }
 
+    // libdma's receive calls only program the channel, like sceDmaSend does:
+    // sceDmaRecv(d) starts a destination-chain transfer (tags come from the
+    // source, e.g. scratchpad for fromSPR), sceDmaRecvN/I(d, addr, qwc) a normal
+    // one. The channel registers do the rest, so write them through the DMAC.
     void sceDmaRecv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDmaRecv", rdram, ctx, runtime);
+        const uint32_t channelBase = resolveDmaChannelBase(rdram, getRegU32(ctx, 4));
+        if (channelBase == 0u)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        auto &mem = runtime->memory();
+        uint32_t chcr = mem.readIORegister(channelBase);
+        chcr = (chcr & ~0xCu) | 0x4u; // MOD = chain
+        chcr &= ~0x1u;                // DIR = to memory
+        mem.writeIORegister(channelBase + 0x20u, 0u);
+        mem.writeIORegister(channelBase, chcr | 0x100u); // STR
+        setReturnS32(ctx, 0);
     }
 
     void sceDmaRecvI(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDmaRecvI", rdram, ctx, runtime);
+        sceDmaRecvN(rdram, ctx, runtime);
     }
 
     void sceDmaRecvN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDmaRecvN", rdram, ctx, runtime);
+        const uint32_t channelBase = resolveDmaChannelBase(rdram, getRegU32(ctx, 4));
+        if (channelBase == 0u)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        auto &mem = runtime->memory();
+        uint32_t chcr = mem.readIORegister(channelBase);
+        chcr &= ~0xCu; // MOD = normal
+        chcr &= ~0x1u; // DIR = to memory
+        mem.writeIORegister(channelBase + 0x10u, getRegU32(ctx, 5));
+        mem.writeIORegister(channelBase + 0x20u, getRegU32(ctx, 6) & 0xFFFFu);
+        mem.writeIORegister(channelBase, chcr | 0x100u); // STR
+        setReturnS32(ctx, 0);
     }
 
     void sceDmaReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

@@ -1602,6 +1602,69 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         return false;
 
     const uint32_t mode = (chcr >> 2u) & 0x3u;
+    if (mode == 1u && channelBase == kSprFromChannel)
+    {
+    // fromSPR destination chain: each DMAtag sits in scratchpad at SADR followed by
+    // its QWC quadwords, which land at the tag's ADDR in main memory. CNTS/CNT tags
+    // continue with the next tag; END (or IRQ with CHCR.TIE) finishes the transfer.
+
+        static constexpr uint32_t kSprFromChannel = 0x1000D000u;
+        static constexpr uint32_t kTagCnts = 0u;
+        static constexpr uint32_t kTagCnt = 1u;
+        static constexpr uint32_t kTagEnd = 7u;
+        static constexpr int kMaxTags = 1 << 16;
+
+        const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+        uint32_t scratchOffset = m_ioRegisters[kSprFromChannel + 0x80u] & 0x3FF0u;
+        uint32_t madr = m_ioRegisters[kSprFromChannel + 0x10u] & 0x7FFFFFF0u;
+        uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+
+        for (int tags = 0; tags < kMaxTags; ++tags)
+        {
+            uint64_t tag = 0;
+            std::memcpy(&tag, m_scratchpad + scratchOffset, sizeof(tag));
+            scratchOffset = (scratchOffset + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+
+            const uint32_t qwc = static_cast<uint32_t>(tag & 0xFFFFu);
+            const uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7u);
+            const bool irq = ((tag >> 31) & 1u) != 0u;
+            lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
+            madr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFF0u);
+
+            uint32_t mainOffset = 0u;
+            try
+            {
+                mainOffset = translateAddress(madr);
+            }
+            catch (const std::exception &)
+            {
+                break;
+            }
+            const uint32_t bytes = qwc * 16u;
+            if (mainOffset > PS2_RAM_SIZE || bytes > PS2_RAM_SIZE - mainOffset)
+                break;
+
+            for (uint32_t copied = 0u; copied < bytes;)
+            {
+                const uint32_t chunk = std::min(bytes - copied, PS2_SCRATCHPAD_SIZE - scratchOffset);
+                std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
+                copied += chunk;
+                scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+            }
+            markModified(mainOffset, bytes);
+            madr += bytes;
+
+            if (id == kTagEnd || (irq && tieEnabled) || (id != kTagCnts && id != kTagCnt))
+                break;
+        }
+
+        m_ioRegisters[kSprFromChannel + 0x10u] = madr & 0x7FFFFFF0u;
+        m_ioRegisters[kSprFromChannel + 0x20u] = 0u;
+        m_ioRegisters[kSprFromChannel + 0x80u] = scratchOffset & 0x3FF0u;
+        m_ioRegisters[kSprFromChannel] = (m_ioRegisters[kSprFromChannel] & 0x0000FFFFu) | (lastTagUpper << 16);
+        completeDmacChannel(kSprFromChannel, 8u);
+        return true;
+    }
     if (mode != 0u)
         return false;
 
