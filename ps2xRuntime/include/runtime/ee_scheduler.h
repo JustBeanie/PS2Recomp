@@ -236,6 +236,7 @@ enum class EeEventType : uint8_t
     Dmac,
     ExternalWake,
     Alarm,
+    GsInterrupt, // GS SIGNAL/FINISH event: INTC cause 0
 };
 
 struct EeEvent

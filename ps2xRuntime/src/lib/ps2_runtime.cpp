@@ -109,6 +109,35 @@ namespace
 
     thread_local DispatchHistory g_dispatchHistory;
 
+    const char *eeThreadStatusName(EeThreadStatus status)
+    {
+        switch (status)
+        {
+        case EeThreadStatus::Running: return "run";
+        case EeThreadStatus::Ready: return "ready";
+        case EeThreadStatus::Waiting: return "wait";
+        case EeThreadStatus::WaitingSuspended: return "wait+susp";
+        case EeThreadStatus::Suspended: return "susp";
+        case EeThreadStatus::Dormant: return "dormant";
+        }
+        return "?";
+    }
+
+    const char *eeWaitReasonName(EeWaitReason reason)
+    {
+        switch (reason)
+        {
+        case EeWaitReason::None: return "-";
+        case EeWaitReason::Sleep: return "sleep";
+        case EeWaitReason::Semaphore: return "sema";
+        case EeWaitReason::EventFlag: return "evflag";
+        case EeWaitReason::VSync: return "vsync";
+        case EeWaitReason::External: return "external";
+        case EeWaitReason::Mpeg: return "mpeg";
+        }
+        return "?";
+    }
+
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
         std::ifstream file(path, std::ios::binary);
@@ -665,6 +694,10 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    // GS interrupts are dispatched by the scheduler at its next checkpoint;
+    // the GIF path may be running inside guest code when FINISH is written.
+    m_gs.setInterruptHook([this]()
+                          { m_eeScheduler->postEvent(EeEvent{EeEventType::GsInterrupt, 0u, 0u}); });
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
@@ -682,6 +715,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                     runVu1ToCompletion(top, itop);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -700,6 +734,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
+                                     runVu1ToCompletion(top, itop);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -971,9 +1006,25 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     }
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        // Interrupt handlers and callbacks run on these stacks. The real EE runs
+        // them on the kernel's stack, in the kernel's first megabyte, which no
+        // game touches. Carving them from the top of RAM instead overlapped game
+        // heaps that run to the end of memory (Sly 2: every GS/vblank interrupt
+        // zeroed an object-list entry at 0x1ff3fe4). Use the free kernel range
+        // above the runtime's syscall mirrors when the ELF loads above it.
+        constexpr uint32_t kKernelStackFloor = 0x00080000u; // above kMirrorLimit
+        constexpr uint32_t kKernelStackTop = 0x00100000u;   // standard ELF base
+        if ((moduleBase & 0x1FFFFFFFu) >= kKernelStackTop)
+        {
+            m_asyncCallbackStackFloor = kKernelStackFloor;
+            m_asyncCallbackStackTop = kKernelStackTop;
+        }
+        else
+        {
+            const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+            m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
+            m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        }
     }
 
     LoadedModule module;
@@ -1444,6 +1495,31 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
                   m_gs, &m_memory,
                   startPC, 0u, ctx->vu0_itop, 4096);
     copyVu0StateToContext(m_vu0.state(), ctx);
+}
+
+void PS2Runtime::runVu1ToCompletion(uint32_t top, uint32_t itop)
+{
+    // A VU1 microprogram runs until its E-bit; VIF holds the next VIFcode until
+    // VU1 is idle. Executing a single fixed budget silently dropped the rest of
+    // long programs, including their final XGKICK (Sly 2's first level frame
+    // lost the packet carrying FINISH and its render thread waited forever).
+    constexpr uint32_t kSliceCycles = 65536u;
+    constexpr int kMaxSlices = 1024; // ~67M VU cycles: far past any real frame
+    int slices = 0;
+    while (m_vu1.state().running && slices < kMaxSlices)
+    {
+        m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                     m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                     m_gs, &m_memory, top, itop, kSliceCycles);
+        ++slices;
+    }
+    if (m_vu1.state().running)
+    {
+        static uint32_t warned = 0;
+        if (warned++ < 8)
+            std::cerr << "[VU1] program still running after " << kMaxSlices << " slices at pc=0x" << std::hex
+                      << m_vu1.state().pc << std::dec << "; abandoning (possible infinite loop)" << std::endl;
+    }
 }
 
 void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
@@ -2417,6 +2493,27 @@ void PS2Runtime::run()
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
                                                << std::endl);
+
+                // Scheduler clock: timed events (vblank, alarms) only fire once
+                // eeCycle reaches them, so a stuck eeCycle stalls everything timed.
+                RUNTIME_LOG("[run:sched] eeCycle=" << eeSnapshot.eeCycle
+                                                   << " nextEventCycle=" << eeSnapshot.nextEventCycle
+                                                   << " running=" << eeSnapshot.runningThreadId
+                                                   << std::endl);
+
+                // One line per guest thread: what a hang is actually waiting on.
+                for (const EeThreadSnapshot &t : eeSnapshot.threads)
+                {
+                    RUNTIME_LOG("[run:thread] id=" << t.id
+                                                   << " prio=" << t.currentPriority
+                                                   << " " << eeThreadStatusName(t.status)
+                                                   << " on=" << eeWaitReasonName(t.waitReason)
+                                                   << ":" << t.waitId
+                                                   << std::hex << " pc=0x" << t.pc
+                                                   << " ra=0x" << t.ra
+                                                   << " entry=0x" << t.entry << std::dec
+                                                   << std::endl);
+                }
 
             }
         });

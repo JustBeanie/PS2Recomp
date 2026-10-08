@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -105,6 +106,9 @@ public:
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
+    // Called when SIGNAL/FINISH sets its CSR bit and IMR leaves it unmasked,
+    // i.e. when real hardware raises the GS interrupt (INTC cause 0).
+    void setInterruptHook(std::function<void()> hook) { m_interruptHook = std::move(hook); }
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -180,6 +184,10 @@ private:
     uint8_t *m_localMemoryStorage = nullptr;
     uint32_t m_localMemorySize = 0u;
     struct GSRegisters *m_privRegs = nullptr;
+    std::function<void()> m_interruptHook;
+    static constexpr uint64_t kImrSignalMask = 1ull << 8;  // IMR.SIGMSK
+    static constexpr uint64_t kImrFinishMask = 1ull << 9;  // IMR.FINISHMSK
+    void raiseInterruptIfUnmasked(uint64_t csrBefore, uint64_t csrBit, uint64_t imrMask);
     mutable std::recursive_mutex m_stateMutex;
     mutable std::mutex m_backendLifetimeMutex;
     mutable std::mutex m_presentationMutex;

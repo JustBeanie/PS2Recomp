@@ -27,6 +27,7 @@ struct VU1State
     bool tBitEnabled;
     bool stoppedByD;
     bool stoppedByT;
+    bool running; // last run stopped on the cycle budget, not at E-bit/halt
     uint32_t top;  // VIF TOP visible to XTOP
     uint32_t itop; // VIF ITOP visible to XITOP
 

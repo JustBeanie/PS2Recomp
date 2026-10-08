@@ -111,6 +111,16 @@ GS::GS()
     reset();
 }
 
+// The GS raises its interrupt when a CSR event bit goes 0 -> 1 while the
+// matching IMR mask bit is clear; the handler acknowledges by writing the CSR
+// bit back (write-1-to-clear), which re-arms it. Games block on this: e.g.
+// Sly 2 sends a packet ending in FINISH and WaitSemas for its handler.
+void GS::raiseInterruptIfUnmasked(uint64_t csrBefore, uint64_t csrBit, uint64_t imrMask)
+{
+    if ((csrBefore & csrBit) == 0u && m_privRegs && (m_privRegs->imr & imrMask) == 0u && m_interruptHook)
+        m_interruptHook();
+}
+
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
     m_localMemoryStorage = vram;
@@ -1470,7 +1480,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
             lo = (lo & ~mask) | (id & mask);
             m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
-            m_privRegs->csr.fetch_or(0x1);
+            const uint64_t before = m_privRegs->csr.fetch_or(0x1);
+            raiseInterruptIfUnmasked(before, 0x1, kImrSignalMask);
         }
         break;
     }
@@ -1482,7 +1493,10 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             m_backend->Sync(GSSyncReason::Finish);
         }
         if (m_privRegs)
-            m_privRegs->csr.fetch_or(0x2);
+        {
+            const uint64_t before = m_privRegs->csr.fetch_or(0x2);
+            raiseInterruptIfUnmasked(before, 0x2, kImrFinishMask);
+        }
         break;
     }
     case GS_REG_LABEL:

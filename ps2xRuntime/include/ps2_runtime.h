@@ -362,6 +362,8 @@ public:
     void SignalException(R5900Context *ctx, PS2Exception exception);
 
     void executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
+    // Keep resuming VU1 until its program reaches E-bit/halt (VIF waits for it).
+    void runVu1ToCompletion(uint32_t top, uint32_t itop);
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
 
 public:
