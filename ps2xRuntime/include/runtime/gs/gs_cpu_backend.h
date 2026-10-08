@@ -55,6 +55,8 @@ private:
     void KickPendingDraws();
     void WaitForDraws();
     void DrainDraws();
+    bool DrawConflictsWithPending(const GSDrawState &state) const;
+    void MarkPendingAccess(const GSDrawState &state);
 
     void ResetUnlocked();
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
@@ -112,4 +114,7 @@ private:
     bool m_batchInFlight = false;
     bool m_stopWorkers = false;
     uint64_t m_textureCacheEpoch = 0; // bumped by TEXFLUSH; workers invalidate on change
+    // 8 KB VRAM pages written / sampled by queued or in-flight draws (512 pages = 4 MB).
+    std::array<uint64_t, 8> m_pendingWritePages{};
+    std::array<uint64_t, 8> m_pendingReadPages{};
 };

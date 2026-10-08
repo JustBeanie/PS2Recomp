@@ -41,6 +41,45 @@ namespace
         return fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT24 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S;
     }
 
+    // GS local memory is 512 pages of 8 KB. Page heights per pixel format: 32-bit
+    // formats use 64x32-pixel pages, 16-bit 64x64, 8-bit 128x64 and 4-bit 128x128.
+    constexpr uint32_t kVramPages = 512u;
+
+    uint32_t pageHeightForPsm(uint32_t psm)
+    {
+        switch (psm)
+        {
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            return 64u;
+        case GS_PSM_T8:
+            return 64u;
+        case GS_PSM_T4:
+            return 128u;
+        default:
+            return 32u; // 32/24-bit formats, and T8H/T4HL/T4HH which live in CT32 pages
+        }
+    }
+
+    uint32_t pageWidthForPsm(uint32_t psm)
+    {
+        return (psm == GS_PSM_T8 || psm == GS_PSM_T4) ? 128u : 64u;
+    }
+
+    // Conservative page span [first, last] for rows y0..y1 of a buffer that is
+    // widthPixels wide (whole page rows, every column).
+    void pageSpan(uint32_t basePage, uint32_t widthPixels, uint32_t psm, uint32_t y0, uint32_t y1,
+                  uint32_t &first, uint32_t &last)
+    {
+        const uint32_t pageW = pageWidthForPsm(psm);
+        const uint32_t pageH = pageHeightForPsm(psm);
+        const uint32_t pagesPerRow = std::max<uint32_t>(1u, (widthPixels + pageW - 1u) / pageW);
+        first = basePage + (y0 / pageH) * pagesPerRow;
+        last = basePage + (y1 / pageH) * pagesPerRow + pagesPerRow - 1u;
+    }
+
     uint32_t rasterWorkerCountFromEnvironment()
     {
         if (const char *env = std::getenv("PS2X_GS_THREADS"))
@@ -649,6 +688,73 @@ void GSCpuBackend::DrainDraws()
         return;
     KickPendingDraws();
     WaitForDraws();
+    m_pendingWritePages.fill(0u);
+    m_pendingReadPages.fill(0u);
+}
+
+namespace
+{
+    using PageSet = std::array<uint64_t, 8>;
+
+    // Calls fn(page) for the frame and (when written) Z pages a draw can touch.
+    template <typename Fn>
+    void forEachWrittenPage(const GSDrawState &state, Fn &&fn)
+    {
+        const auto &ctx = state.context;
+        auto span = [&](uint32_t basePage, uint32_t psm)
+        {
+            uint32_t first = 0, last = 0;
+            pageSpan(basePage, std::max<uint32_t>(ctx.frame.fbw, 1u) * 64u, psm, ctx.scissor.y0, ctx.scissor.y1, first, last);
+            for (uint32_t page = first; page <= last && page - first < kVramPages; ++page)
+                fn(page % kVramPages);
+        };
+        span(ctx.frame.fbp, ctx.frame.psm);
+        if (!ctx.zbuf.zmask)
+            span(ctx.zbuf.zbp, ctx.zbuf.psm);
+    }
+
+    // Calls fn(page) for the texture pages a textured draw can sample.
+    template <typename Fn>
+    void forEachSampledPage(const GSDrawState &state, Fn &&fn)
+    {
+        if (!state.prim.tme)
+            return;
+        const auto &tex = state.context.tex0;
+        const uint32_t widthPixels = std::max<uint32_t>(tex.tbw, 1u) * 64u;
+        const uint32_t height = std::max<uint32_t>(state.textureHeight, 1u);
+        uint32_t first = 0, last = 0;
+        pageSpan(tex.tbp0 >> 5, widthPixels, tex.psm, 0u, height - 1u, first, last);
+        for (uint32_t page = first; page <= last && page - first < kVramPages; ++page)
+            fn(page % kVramPages);
+    }
+
+    bool pageSetHas(const PageSet &set, uint32_t page)
+    {
+        return ((set[page >> 6] >> (page & 63u)) & 1ull) != 0u;
+    }
+
+    void pageSetAdd(PageSet &set, uint32_t page)
+    {
+        set[page >> 6] |= 1ull << (page & 63u);
+    }
+}
+
+bool GSCpuBackend::DrawConflictsWithPending(const GSDrawState &state) const
+{
+    bool conflict = false;
+    forEachSampledPage(state, [&](uint32_t page)
+                       { conflict = conflict || pageSetHas(m_pendingWritePages, page); });
+    forEachWrittenPage(state, [&](uint32_t page)
+                       { conflict = conflict || pageSetHas(m_pendingReadPages, page); });
+    return conflict;
+}
+
+void GSCpuBackend::MarkPendingAccess(const GSDrawState &state)
+{
+    forEachWrittenPage(state, [&](uint32_t page)
+                       { pageSetAdd(m_pendingWritePages, page); });
+    forEachSampledPage(state, [&](uint32_t page)
+                       { pageSetAdd(m_pendingReadPages, page); });
 }
 
 void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
@@ -693,6 +799,13 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         DrawPrimitive(batch);
         return;
     }
+    // Workers run each draw band by band, so a draw that samples pages queued draws
+    // still write (render-to-texture), or writes pages queued draws still sample,
+    // would see other bands half done. Wait for the queue first.
+    if (DrawConflictsWithPending(batch.state))
+        DrainDraws();
+    MarkPendingAccess(batch.state);
+
     constexpr size_t kDrawBatchSize = 128u;
     m_pendingDraws.push_back(batch);
     if (m_pendingDraws.size() >= kDrawBatchSize)
