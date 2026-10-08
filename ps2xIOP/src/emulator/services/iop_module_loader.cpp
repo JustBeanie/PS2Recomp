@@ -438,18 +438,23 @@ namespace ps2x::iop::detail
         int64_t delta = 0;
         if (relocate)
         {
-            base = alignUp(moduleCursor, 0x100u);
-            if (base + span >= IopMemory::HeapBase)
+            // Modules come out of the shared SYSMEM pool (256-byte blocks), so
+            // they can't collide with AllocSysMemory blocks and vice versa.
+            base = memory.allocate(span, 0x100u);
+            if (base == 0u)
             {
                 result.error = IopImageLoadError::ArenaExhausted;
                 return result;
             }
             delta = static_cast<int64_t>(base) - minVaddr;
-            result.nextModuleCursor = base + span;
+            result.nextModuleCursor = std::max(moduleCursor, base + span);
         }
         else
         {
             base = minVaddr;
+            // Reserve a fixed-address image's range so later blocks avoid it.
+            // Overlapping fixed images are still loaded, as before.
+            (void)memory.allocate(span, 16u, base);
         }
 
         if (hasLoad)

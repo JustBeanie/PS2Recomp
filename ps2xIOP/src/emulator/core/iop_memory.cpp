@@ -307,7 +307,9 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        // First fit from the bottom of the pool, like SYSMEM's default mode, so
+        // freed blocks (unloaded modules, released buffers) are reused.
+        uint32_t candidate = alignUp(HeapBase, alignment);
         for (;;)
         {
             bool overlap = false;

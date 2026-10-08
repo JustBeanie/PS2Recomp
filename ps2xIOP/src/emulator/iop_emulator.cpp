@@ -679,6 +679,7 @@ namespace ps2x::iop::detail
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
+            (void)memory.freeAllocation(it->second.base); // back to the SYSMEM pool
             modules.erase(it);
             kernel.cleanupDeadThreads();
             if (result)

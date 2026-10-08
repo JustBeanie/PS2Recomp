@@ -58,7 +58,12 @@ if(PS2X_IOP_BUILD_TESTS)
     target_link_libraries(ps2_iop_compatibility_tests PRIVATE ps2_iop)
     add_test(NAME ps2_iop_compatibility_tests COMMAND ps2_iop_compatibility_tests)
 
-    add_executable(ps2_iop_ohci_tests tests/iop_ohci_tests.cpp)
+    add_executable(ps2_iop_memory_tests tests/iop_memory_tests.cpp)
+target_link_libraries(ps2_iop_memory_tests PRIVATE ps2_iop)
+target_include_directories(ps2_iop_memory_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME ps2_iop_memory_tests COMMAND ps2_iop_memory_tests)
+
+add_executable(ps2_iop_ohci_tests tests/iop_ohci_tests.cpp)
 target_link_libraries(ps2_iop_ohci_tests PRIVATE ps2_iop)
 target_include_directories(ps2_iop_ohci_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME ps2_iop_ohci_tests COMMAND ps2_iop_ohci_tests)

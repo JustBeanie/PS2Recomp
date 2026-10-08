@@ -24,7 +24,11 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // One SYSMEM pool, as on the real IOP: relocatable modules and
+        // AllocSysMemory/sceSifAllocIopHeap blocks come from the same range, so
+        // RAM the modules don't use stays allocatable. Above HeapLimit are the
+        // emulator's nested-call stacks.
+        static constexpr uint32_t HeapBase = 0x00010000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
