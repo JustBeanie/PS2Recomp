@@ -1455,10 +1455,21 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
+    // A checkpoint inside the callee unwinds every activation to the dispatcher,
+    // which resumes at ctx->pc. Keep unwinding: in recursive code the pending pc
+    // can equal this call's entry (a nested call to the same function was about
+    // to be dispatched) or its fallthrough, and treating either as a completed
+    // call drops the callee's remaining levels and leaves $sp short.
+    if (m_eeScheduler && m_eeScheduler->checkpointPending())
+    {
+        return false;
+    }
+
     if (ctx->pc == entryPc)
     {
         ctx->pc = fallthroughPc;
     }
+
 
     return ctx->pc == fallthroughPc;
 }

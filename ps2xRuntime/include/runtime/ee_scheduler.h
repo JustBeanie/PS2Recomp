@@ -280,6 +280,11 @@ public:
     void requestStop();
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+    // True while generated code is unwinding to the dispatcher for a checkpoint.
+    [[nodiscard]] bool checkpointPending() const noexcept
+    {
+        return m_checkpointPending.load(std::memory_order_acquire);
+    }
     void accountCycles(uint32_t cycles) noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
