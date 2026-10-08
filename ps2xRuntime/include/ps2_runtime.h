@@ -237,6 +237,29 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
+// Guest-memory write watchpoint: PS2X_WATCH_WRITE=addr[+length][:value] logs every
+// guest store and HLE range write overlapping [addr, addr+length) of physical RAM,
+// with the guest pc/ra/sp, optionally only when a stored aligned 32-bit word equals
+// value. Disabled (length = 0) it costs two unsigned compares per store.
+struct Ps2WriteWatch
+{
+    uint32_t addr = 0u;
+    uint32_t length = 0u;
+    uint32_t value = 0u;
+    bool matchValue = false;
+};
+inline Ps2WriteWatch g_ps2WriteWatch;
+
+void ps2ReportWatchedWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
+                           bool valueKnown, const char *op, const R5900Context *ctx);
+
+inline bool ps2WriteWatchOverlaps(uint32_t guestAddr, uint32_t size)
+{
+    const uint32_t phys = guestAddr & PS2_RAM_MASK;
+    return phys - g_ps2WriteWatch.addr < g_ps2WriteWatch.length ||
+           (g_ps2WriteWatch.length != 0u && g_ps2WriteWatch.addr - phys < size);
+}
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -246,13 +269,8 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)valueLo;
-    (void)valueHi;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    if (ps2WriteWatchOverlaps(guestAddr, size))
+        ps2ReportWatchedWrite(guestAddr, size, valueLo, valueHi, true, op, ctx);
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
@@ -262,11 +280,8 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    if (ps2WriteWatchOverlaps(guestAddr, size))
+        ps2ReportWatchedWrite(guestAddr, size, 0u, 0u, false, op, ctx);
 }
 
 class PS2Runtime

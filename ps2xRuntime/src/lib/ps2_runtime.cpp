@@ -28,6 +28,67 @@
 #include <sstream>
 #include "runtime/ps2_perf_stats.h"
 
+namespace
+{
+    // PS2X_WATCH_WRITE=addr[+length][:value], hex or decimal,
+    // e.g. 0x471be0:0xff818181 or 0x470000+0x4000:0xff818181
+    struct WriteWatchFromEnvironment
+    {
+        WriteWatchFromEnvironment()
+        {
+            const char *env = std::getenv("PS2X_WATCH_WRITE");
+            if (!env || !*env)
+                return;
+            char *end = nullptr;
+            g_ps2WriteWatch.addr = static_cast<uint32_t>(std::strtoul(env, &end, 0)) & PS2_RAM_MASK;
+            g_ps2WriteWatch.length = 4u;
+            if (end && *end == '+')
+                g_ps2WriteWatch.length = std::max<uint32_t>(1u, static_cast<uint32_t>(std::strtoul(end + 1, &end, 0)));
+            if (end && *end == ':')
+            {
+                g_ps2WriteWatch.value = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 0));
+                g_ps2WriteWatch.matchValue = true;
+            }
+            std::fprintf(stderr, "[watch] guest writes to 0x%08x..0x%08x%s\n", g_ps2WriteWatch.addr,
+                         g_ps2WriteWatch.addr + g_ps2WriteWatch.length, g_ps2WriteWatch.matchValue ? " (value-matched)" : "");
+        }
+    } s_writeWatchFromEnvironment;
+}
+
+void ps2ReportWatchedWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
+                           bool valueKnown, const char *op, const R5900Context *ctx)
+{
+    const uint32_t phys = guestAddr & PS2_RAM_MASK;
+    uint32_t hitAddr = phys;
+    uint32_t word = 0u;
+    if (valueKnown)
+    {
+        // Check each aligned word of the store that lies inside the watched range.
+        bool found = false;
+        for (uint32_t offset = 0; offset + 4u <= size && !found; offset += 4u)
+        {
+            const uint32_t addr = phys + offset;
+            if (addr - g_ps2WriteWatch.addr >= g_ps2WriteWatch.length)
+                continue;
+            const uint64_t lane = offset < 8u ? valueLo : valueHi;
+            const uint32_t candidate = static_cast<uint32_t>(lane >> ((offset & 7u) * 8u));
+            if (!g_ps2WriteWatch.matchValue || candidate == g_ps2WriteWatch.value)
+            {
+                found = true;
+                hitAddr = addr;
+                word = candidate;
+            }
+        }
+        if (!found && (g_ps2WriteWatch.matchValue || size >= 4u))
+            return;
+    }
+    const uint32_t pc = ctx ? ctx->pc : 0u;
+    const uint32_t ra = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u;
+    const uint32_t sp = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) : 0u;
+    std::fprintf(stderr, "[watch] %s addr=0x%08x size=%u word=%s0x%08x pc=0x%08x ra=0x%08x sp=0x%08x\n",
+                 op ? op : "?", hitAddr, size, valueKnown ? "" : "(range) ", word, pc, ra, sp);
+}
+
 namespace ps2_stubs
 {
     void resetSifState();
