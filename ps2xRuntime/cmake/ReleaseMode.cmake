@@ -7,6 +7,11 @@ check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
 # it off while iterating on link/boot errors.
 option(PS2X_ENABLE_LTO "Whole-program optimization (/GL + /LTCG, IPO) for Release" ON)
 
+# Optimized code plus a PDB, so sampling profilers (Very Sleepy, WPA, VTune)
+# can name hot functions. /Z7 keeps debug info in each .obj, which avoids
+# PDB-server contention in parallel builds.
+option(PS2X_ENABLE_DEBUG_SYMBOLS "Emit a PDB for Release builds (profiling)" OFF)
+
 function(EnableFastReleaseMode TargetName)
     message("> Enabling optimization for: ${TargetName} (LTO=${PS2X_ENABLE_LTO})")
     if(MSVC)
@@ -31,6 +36,11 @@ function(EnableFastReleaseMode TargetName)
                 /Qspectre- # Disable Spectre mitigations (faster)
             >
         )
+
+        if(PS2X_ENABLE_DEBUG_SYMBOLS)
+            target_compile_options(${TargetName} PRIVATE $<$<CONFIG:Release>:/Z7>)
+            target_link_options(${TargetName} PRIVATE $<$<CONFIG:Release>:/DEBUG>)
+        endif()
 
         if(TARGET ${TargetName})
             target_link_options(${TargetName} PRIVATE
