@@ -402,9 +402,19 @@ if(PS2X_ENABLE_RUNTIME_LOGS)
     )
 endif()
 
+# Per-function enter/exit lines in ps2_log.txt from every generated function.
+# Separate from aggressive logs: it writes on every guest call, which slows
+# busy-polling loops so much that emulated time (and vblank) nearly stops.
+option(PS2X_ENABLE_FUNCTION_LOG_TRACKER "Log every recompiled function entry/exit (very slow)" ${PS2X_ENABLE_AGRESSIVE_LOGS})
+
 if(PS2X_ENABLE_AGRESSIVE_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         AGRESSIVE_LOGS=1
+    )
+endif()
+
+if(PS2X_ENABLE_FUNCTION_LOG_TRACKER)
+    target_compile_definitions(ps2_runtime PUBLIC
         PS2_FUNCTION_LOG_TRACKER=1
     )
 endif()
