@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+
 #include <stdexcept>
 #include <algorithm>
 #include <string>
@@ -1344,7 +1345,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // Hardware has no tag limit; this only guards against a runaway
+                    // (looping) chain. Level loads can exceed several thousand tags.
+                    const int kMaxChainTags = 1 << 20;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1519,6 +1522,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             endChain = true;
                         if (endChain)
                             break;
+                    }
+
+                    if (tagsProcessed >= kMaxChainTags)
+                    {
+                        std::cerr << "[dma] chain on channel 0x" << std::hex << channelBase
+                                  << " exceeded " << std::dec << kMaxChainTags
+                                  << " tags; truncated at tadr 0x" << std::hex << tagAddr << std::dec << std::endl;
                     }
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
