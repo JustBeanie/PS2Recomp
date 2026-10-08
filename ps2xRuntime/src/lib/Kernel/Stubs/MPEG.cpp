@@ -501,6 +501,16 @@ namespace ps2_stubs
             std::vector<uint8_t> pssBuffer;
             std::vector<uint32_t> pssGuestAddrs;
             std::deque<MpegDecodedFrame> decodedFrames;
+            // Demuxed video elementary-stream chunks not yet decoded. Like the
+            // real libmpeg ES buffer: demux only queues, sceMpegGetPicture decodes.
+            struct PendingEs
+            {
+                std::vector<uint8_t> bytes;
+                int64_t pts90k = -1;
+                int64_t dts90k = -1;
+            };
+            std::deque<PendingEs> pendingEs;
+            size_t pendingEsBytes = 0u;
             std::unique_ptr<MpegFfmpegDecoder> decoder;
             uint8_t frameRateCode = 0u;
             uint8_t frameRateExtensionN = 0u;
@@ -1012,7 +1022,7 @@ namespace ps2_stubs
             }
         }
 
-        void feedElementaryStream(MpegPlaybackState &playback, const uint8_t *data, size_t size, int64_t pts90k = -1, int64_t dts90k = -1)
+        void decodeElementaryStream(MpegPlaybackState &playback, const uint8_t *data, size_t size, int64_t pts90k, int64_t dts90k)
         {
             if (!data || size == 0)
             {
@@ -1108,6 +1118,34 @@ namespace ps2_stubs
 
             playback.videoSequenceSyncBuffer.clear();
             flushDecoderIfEnded(playback);
+        }
+
+        // Demux side: queue the chunk for decoding when a picture is requested.
+        // Decoding eagerly here forced a cap on decoded pictures, which made
+        // demux refuse input the real library accepts; a player that demuxes
+        // until its ring is consumed before asking for a picture (Sly 2) then
+        // never got past the first picture.
+        void feedElementaryStream(MpegPlaybackState &playback, const uint8_t *data, size_t size, int64_t pts90k = -1, int64_t dts90k = -1)
+        {
+            if (!data || size == 0)
+            {
+                return;
+            }
+            playback.sawInput = true;
+            playback.pendingEs.push_back({std::vector<uint8_t>(data, data + size), pts90k, dts90k});
+            playback.pendingEsBytes += size;
+        }
+
+        // Decode queued chunks: until a picture is available, or all of them.
+        void decodePendingEs(MpegPlaybackState &playback, bool all)
+        {
+            while (!playback.pendingEs.empty() && (all || playback.decodedFrames.empty()))
+            {
+                MpegPlaybackState::PendingEs chunk = std::move(playback.pendingEs.front());
+                playback.pendingEs.pop_front();
+                playback.pendingEsBytes -= chunk.bytes.size();
+                decodeElementaryStream(playback, chunk.bytes.data(), chunk.bytes.size(), chunk.pts90k, chunk.dts90k);
+            }
         }
 
         void erasePssPrefix(MpegPlaybackState &playback, size_t count)
@@ -1216,6 +1254,7 @@ namespace ps2_stubs
 
                 if (streamId == kMpegProgramEnd)
                 {
+                    decodePendingEs(playback, true); // before streamEnded: each decode flushes once ended
                     playback.streamEnded = true;
                     playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
                     flushDecoderIfEnded(playback);
@@ -1372,6 +1411,7 @@ namespace ps2_stubs
         {
             std::vector<MpegStreamCallbackEvent> ignoredCallbacks;
             processPssBuffer(mpegAddr, playback, ignoredCallbacks, true);
+            decodePendingEs(playback, true); // before streamEnded: each decode flushes once ended
             playback.streamEnded = true;
             playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
             flushDecoderIfEnded(playback);
@@ -1409,8 +1449,14 @@ namespace ps2_stubs
             // lets the game's producer loop wake the consumer again. Backpressure
             // still propagates naturally to sceCdStRead because the ring does not
             // advance while this is true.
+            //
+            // Decoding is on demand (sceMpegGetPicture), so decoded pictures no
+            // longer pile up here; what's bounded is undecoded bitstream, like the
+            // real ES buffer filling. 8 MB is far beyond any real buffer.
+            constexpr size_t kMaxPendingEsBytes = 8u * 1024u * 1024u;
             return !g_mpeg_stub_state.currentCdStreamEofSeen &&
-                   playback.decodedFrames.size() >= kMaxDecodedPicturesAhead;
+                   (playback.decodedFrames.size() >= kMaxDecodedPicturesAhead ||
+                    playback.pendingEsBytes >= kMaxPendingEsBytes);
         }
 
         void recordCdStreamBytesDemuxedUnlocked(
@@ -1858,6 +1904,7 @@ namespace ps2_stubs
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
             const size_t framesBefore = playback.decodedFrames.size();
+            decodePendingEs(playback, true);
             if (playback.decoder)
             {
                 playback.decoder->flush(playback.decodedFrames);
@@ -1898,7 +1945,8 @@ namespace ps2_stubs
                 feedElementaryStream(playback, src, chunk);
                 copied += chunk;
             }
-            wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
+            // New bitstream is enough to wake a picture waiter: it decodes on demand.
+            wakePictureWaiter = copied != 0u || playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
         }
 
         if (wakePictureWaiter)
@@ -2116,7 +2164,7 @@ namespace ps2_stubs
             return;
         }
         const bool currentStreamCompleted = std::find(completedMpegIds.begin(), completedMpegIds.end(), mpegAddr) != completedMpegIds.end();
-        if (decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
+        if (consumed != 0u || decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
         {
             runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
         }
@@ -2209,7 +2257,7 @@ namespace ps2_stubs
             return;
         }
         const bool currentStreamCompleted = std::find(completedMpegIds.begin(), completedMpegIds.end(), mpegAddr) != completedMpegIds.end();
-        if (decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
+        if (consumed != 0u || decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
         {
             runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
         }
@@ -2292,6 +2340,7 @@ namespace ps2_stubs
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            decodePendingEs(playback, false);
             if (playback.decodedFrames.empty() &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
                 !playback.streamEnded &&
@@ -2458,9 +2507,16 @@ namespace ps2_stubs
         // Only the producer/demux EOF is authoritative. A sequence_end_code can
         // be observed while more PSS data is still buffered, and a decoder
         // failure before producer EOF may still recover on a later sequence.
-        const bool producerEnded =
-            g_mpeg_stub_state.currentCdStreamEofSeen &&
-            playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
+        //
+        // That EOF only exists when the game streams through sceCdSt*. Games
+        // that read the PSS themselves (Sly 2: plain sceCdRead into its own
+        // ring) never produce it, so for them the demuxer reaching the PSS
+        // program end code is the end of the stream.
+        const bool usesCdStream = g_mpeg_stub_state.cdStreamBytesProduced != 0u;
+        const bool producerEnded = usesCdStream
+                                       ? (g_mpeg_stub_state.currentCdStreamEofSeen &&
+                                          playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration)
+                                       : playback.streamEnded;
         const bool ended = producerEnded &&
                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
         const uint64_t presentationEnd = playback.presentationEndTickQ32;
@@ -2486,7 +2542,7 @@ namespace ps2_stubs
             ++g_mpeg_stub_state.isEndTraceCount;
         }
 
-        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && presentationComplete) ? 1 : 0);
+        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && playback.pendingEs.empty() && presentationComplete) ? 1 : 0);
     }
 
     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2496,7 +2552,7 @@ namespace ps2_stubs
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         const MpegPlaybackState &playback = getPlaybackState(mpegAddr);
-        setReturnS32(ctx, playback.decodedFrames.empty() ? 1 : 0);
+        setReturnS32(ctx, (playback.decodedFrames.empty() && playback.pendingEs.empty()) ? 1 : 0);
     }
 
     void sceMpegReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
