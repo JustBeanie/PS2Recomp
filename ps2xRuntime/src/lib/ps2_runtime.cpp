@@ -26,6 +26,7 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include "runtime/ps2_perf_stats.h"
 
 namespace ps2_stubs
 {
@@ -1500,9 +1501,8 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
 void PS2Runtime::runVu1ToCompletion(uint32_t top, uint32_t itop)
 {
     // A VU1 microprogram runs until its E-bit; VIF holds the next VIFcode until
-    // VU1 is idle. Executing a single fixed budget silently dropped the rest of
-    // long programs, including their final XGKICK (Sly 2's first level frame
-    // lost the packet carrying FINISH and its render thread waited forever).
+    // VU1 is idle. A single fixed cycle budget would silently drop the rest of a
+    // long program, including any final XGKICK.
     constexpr uint32_t kSliceCycles = 65536u;
     constexpr int kMaxSlices = 1024; // ~67M VU cycles: far past any real frame
     int slices = 0;
@@ -2461,6 +2461,48 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    // PS2X_PERF_STATS=1: every 10 s, log frames (GS FINISH count) and where the
+    // EE thread's time went, so builds can be compared without a profiler.
+    std::thread perfStatsThread;
+    if (const char *perfEnv = std::getenv("PS2X_PERF_STATS"); perfEnv && *perfEnv && *perfEnv != '0')
+    {
+        ps2x::perf::enabled.store(true, std::memory_order_relaxed);
+        perfStatsThread = std::thread([&]()
+                                      {
+            ThreadNaming::SetCurrentThreadName("PerfStats");
+            uint64_t lastVuCycles = m_vu1.state().cycles;
+            auto windowStart = std::chrono::steady_clock::now();
+            while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                const auto now = std::chrono::steady_clock::now();
+                if (now - windowStart < std::chrono::seconds(10))
+                    continue;
+                const double seconds = std::chrono::duration<double>(now - windowStart).count();
+                windowStart = now;
+                const uint64_t vuCycles = m_vu1.state().cycles;
+                const uint64_t frames = ps2x::perf::gsFinishes.exchange(0);
+                std::fprintf(stderr, "[perf] %.1fs: frames=%llu (%.1f/s) vif1=%llums vu1=%llums vu1Programs=%llu vu1Cycles=%llu\n",
+                             seconds,
+                             static_cast<unsigned long long>(frames),
+                             static_cast<double>(frames) / seconds,
+                             static_cast<unsigned long long>(ps2x::perf::vif1Nanoseconds.exchange(0) / 1000000ull),
+                             static_cast<unsigned long long>(ps2x::perf::vu1Nanoseconds.exchange(0) / 1000000ull),
+                             static_cast<unsigned long long>(ps2x::perf::vu1Programs.exchange(0)),
+                             static_cast<unsigned long long>(vuCycles - lastVuCycles));
+                lastVuCycles = vuCycles;
+            } });
+    }
+
+    // PS2X_AUTOSHOT_SECONDS=N: save the host window as autoshot_NN.png every N
+    // seconds (in the working directory), for checking output from scripted runs.
+    int autoshotSeconds = 0;
+    if (const char *shotEnv = std::getenv("PS2X_AUTOSHOT_SECONDS"))
+        autoshotSeconds = std::max(0, std::atoi(shotEnv));
+    auto lastAutoshot = std::chrono::steady_clock::now();
+    int autoshotIndex = 0;
+
+
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
@@ -2542,6 +2584,12 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+        if (autoshotSeconds > 0 &&
+            std::chrono::steady_clock::now() - lastAutoshot >= std::chrono::seconds(autoshotSeconds))
+        {
+            lastAutoshot = std::chrono::steady_clock::now();
+            TakeScreenshot(TextFormat("autoshot_%02d.png", autoshotIndex++));
+        }
 
         if (WindowShouldClose())
         {
@@ -2555,6 +2603,10 @@ void PS2Runtime::run()
     if (gameThread.joinable())
     {
         gameThread.join();
+    }
+    if (perfStatsThread.joinable())
+    {
+        perfStatsThread.join();
     }
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)

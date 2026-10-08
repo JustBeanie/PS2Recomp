@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/ps2_perf_stats.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
@@ -1497,6 +1498,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             const uint64_t before = m_privRegs->csr.fetch_or(0x2);
             raiseInterruptIfUnmasked(before, 0x2, kImrFinishMask);
         }
+        if (ps2x::perf::enabled.load(std::memory_order_relaxed))
+            ps2x::perf::gsFinishes.fetch_add(1, std::memory_order_relaxed);
         break;
     }
     case GS_REG_LABEL:

@@ -1,6 +1,8 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
 #include <cstring>
+#include "runtime/ps2_perf_stats.h"
+#include <chrono>
 
 enum VIFCmd : uint8_t
 {
@@ -315,12 +317,49 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+    struct PerfTimer
+    {
+        const bool active = ps2x::perf::enabled.load(std::memory_order_relaxed);
+        const std::chrono::steady_clock::time_point start = active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~PerfTimer()
+        {
+            if (active)
+                ps2x::perf::vif1Nanoseconds.fetch_add(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()),
+                    std::memory_order_relaxed);
+        }
+    } perfTimer;
 
     uint32_t pos = 0;
 
+    // Sends up to availableQw qwords as the continuation of a PATH2 IMAGE whose
+    // GIFtag arrived in an earlier DIRECT; returns how many qwords were consumed.
+    auto submitImageContinuation = [&](const uint8_t *src, uint32_t availableQw) -> uint32_t
+    {
+        const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
+        std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+        const uint64_t imageTag =
+            static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+            ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+            (static_cast<uint64_t>(kGifFmtImage) << 58);
+        std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+        std::memcpy(imagePacket.data() + 16u, src, static_cast<size_t>(chunkQw) * 16u);
+        submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+
+        m_vif1PendingPath2ImageQwc -= chunkQw;
+        if (m_vif1PendingPath2ImageQwc == 0u)
+        {
+            m_vif1PendingPath2DirectHl = false;
+        }
+        return chunkQw;
+    };
+
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
+        // On hardware the VIF keeps decoding VIFcodes while PATH2 is mid-IMAGE, and the
+        // image data arrives in the following DIRECT. Only treat the stream as raw image
+        // qwords when no DIRECT follows (skipping alignment NOPs).
+        if (m_vif1PendingPath2ImageQwc != 0u && !nextVifCodeIsDirect(data + pos, sizeBytes - pos))
         {
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             if (availableQw == 0u)
@@ -418,7 +457,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
             if (m_vu1MscalCallback)
-                m_vu1MscalCallback(startPC, runTop, runItop);
+            {
+                if (ps2x::perf::enabled.load(std::memory_order_relaxed))
+                {
+                    const auto start = std::chrono::steady_clock::now();
+                    m_vu1MscalCallback(startPC, runTop, runItop);
+                    ps2x::perf::vu1Nanoseconds.fetch_add(
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()),
+                        std::memory_order_relaxed);
+                    ps2x::perf::vu1Programs.fetch_add(1, std::memory_order_relaxed);
+                }
+                else
+                {
+                    m_vu1MscalCallback(startPC, runTop, runItop);
+                }
+            }
             continue;
         }
         else if (opcode == VIF_MSCNT)
