@@ -175,6 +175,21 @@ int main(int argc, char *argv[])
     {
         std::filesystem::path pathObj = getExecutablePath(argc, argv);
 
+        // --cd-image <iso>: serve cdvd sector reads (sceCdRead by LBN) straight
+        // from a disc image. Needed by games whose data lives in raw sectors
+        // outside the ISO9660 directory, which a cd root folder can't map.
+        for (int i = 2; i + 1 < argc; ++i)
+        {
+            if (std::string(argv[i]) == "--cd-image")
+            {
+                PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+                paths.cdImage = std::filesystem::path(argv[i + 1]);
+                PS2Runtime::setIoPaths(paths);
+                std::cout << "CD image: " << PS2Runtime::getIoPaths().cdImage.string() << std::endl;
+                break;
+            }
+        }
+
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();
         std::string normalizedId = normalizeGameId(elfName);
