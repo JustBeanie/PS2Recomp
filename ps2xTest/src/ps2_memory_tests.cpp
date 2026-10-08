@@ -2216,6 +2216,68 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "raw image continuation after packed setup should not be decoded as VIF/GIF registers");
         });
 
+        tc.Run("VIF1 DIRECT image data can arrive in the next DIRECT", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            GS gs;
+            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                gs.processGIFPacket(data, sizeBytes);
+            });
+            mem.setGifArbiter(&arbiter);
+
+            const uint64_t bitblt =
+                (static_cast<uint64_t>(1u) << 16) |
+                (static_cast<uint64_t>(1u) << 48);
+            gs.writeRegister(GS_REG_BITBLTBUF, bitblt);
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, (4ull << 0) | (1ull << 32));
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            // Hardware layout: the IMAGE tag ends one DIRECT, its data fills the next
+            // DIRECT, and VIFcodes keep being decoded in between.
+            std::vector<uint8_t> packet;
+            for (int i = 0; i < 3; ++i)
+                appendU32(packet, 0u);                    // NOP alignment
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW: IMAGE tag only.
+            appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(packet, 0ull);
+            for (int i = 0; i < 3; ++i)
+                appendU32(packet, 0u);
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW: the image data.
+            for (uint32_t i = 0; i < 16u; ++i)
+                packet.push_back(static_cast<uint8_t>(0xE0u + i));
+            for (int i = 0; i < 3; ++i)
+                appendU32(packet, 0u);
+            appendU32(packet, makeVifCmd(0x50u, 0u, 2u)); // DIRECT 2 QW: A+D FINISH.
+            appendU64(packet, makeGifTag(1u, GIF_FMT_PACKED, 1u, true));
+            appendU64(packet, 0x0Eull);
+            appendU64(packet, 0ull);
+            appendU64(packet, GS_REG_FINISH);
+
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            const uint8_t *vramOut = mem.getGSVRAM();
+            bool imageOk = true;
+            for (uint32_t x = 0; x < 4u && imageOk; ++x)
+            {
+                const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    if (vramOut[off + c] != static_cast<uint8_t>(0xE0u + x * 4u + c))
+                    {
+                        imageOk = false;
+                        break;
+                    }
+                }
+            }
+            t.IsTrue(imageOk, "the next DIRECT's payload should continue the PATH2 image upload");
+            t.IsTrue((mem.gs().csr & 0x2ull) != 0ull, "VIFcodes after the image should still be decoded (FINISH reaches GS)");
+        });
+
         tc.Run("unaligned accesses throw", [](TestCase &t)
         {
             PS2Memory mem;

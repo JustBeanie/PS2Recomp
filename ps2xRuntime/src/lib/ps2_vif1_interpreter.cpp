@@ -79,6 +79,22 @@ namespace
 
         return 0u;
     }
+
+    // True when the next non-NOP VIFcode in the stream is DIRECT or DIRECTHL.
+    bool nextVifCodeIsDirect(const uint8_t *data, uint32_t sizeBytes)
+    {
+        constexpr uint32_t kMaxNopsToSkip = 3u;
+        for (uint32_t i = 0; i <= kMaxNopsToSkip && (i + 1u) * 4u <= sizeBytes; ++i)
+        {
+            uint32_t code = 0u;
+            std::memcpy(&code, data + i * 4u, sizeof(code));
+            const uint8_t opcode = static_cast<uint8_t>((code >> 24) & 0x7Fu);
+            if (opcode == VIF_NOP)
+                continue;
+            return opcode == VIF_DIRECT || opcode == VIF_DIRECTHL;
+        }
+        return false;
+    }
 }
 
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
@@ -312,22 +328,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 break;
             }
 
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
-
-            pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
+            pos += submitImageContinuation(data + pos, availableQw) * 16u;
             continue;
         }
 
@@ -495,12 +496,22 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > availableQw)
                 qwCount = availableQw;
 
-            if (qwCount > 0)
+            uint32_t packetQw = qwCount;
+            const uint8_t *packetData = data + pos;
+            if (packetQw > 0 && m_vif1PendingPath2ImageQwc != 0u)
+            {
+                // This DIRECT carries the rest of an IMAGE begun by an earlier DIRECT.
+                const uint32_t consumed = submitImageContinuation(packetData, packetQw);
+                packetQw -= consumed;
+                packetData += consumed * 16u;
+            }
+
+            if (packetQw > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+                submitGifPacket(GifPathId::Path2, packetData, packetQw * 16, true, directHl);
 
-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
+                const uint32_t pendingImageQw = pendingGifImageQwc(packetData, packetQw * 16u);
                 if (pendingImageQw != 0u)
                 {
                     m_vif1PendingPath2ImageQwc = pendingImageQw;
