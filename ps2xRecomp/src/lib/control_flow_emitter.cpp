@@ -330,7 +330,15 @@ namespace ps2recomp
         emitDelaySlot("    ");
 
         const uint32_t target = buildAbsoluteJumpTarget(m_branchInst.address, m_branchInst.target);
-        if (isInternalTarget(target))
+        // A call needs its own activation: the callee's `jr $ra` returns from the
+        // C++ function it runs in. Lowering a recursive JAL (or a JAL to another
+        // recompiled entry inside this function) to a goto runs the callee in the
+        // caller's activation, so its return unwinds the caller instead, skipping
+        // the remaining code and epilogues of every level entered that way and
+        // leaving $sp low by their frames.
+        const bool callToRecompiledEntry =
+            kind == StaticBranchKind::Call && !m_gen.getFunctionName(target).empty();
+        if (isInternalTarget(target) && !callToRecompiledEntry)
         {
             emitInternalTarget(target, branchPc(), "    ");
             return;

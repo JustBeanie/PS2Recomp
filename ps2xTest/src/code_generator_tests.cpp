@@ -1607,6 +1607,43 @@ void register_code_generator_tests()
                      "backward internal JAL should not expose a mid-call dispatcher return");
         });
 
+        tc.Run("recursive JAL to a named function is a real call, not a goto", [](TestCase &t) {
+            // A recursive call lowered to a goto runs the inner level in the outer
+            // level's C++ activation; the inner `jr $ra` then unwinds the outer
+            // level too and leaves $sp short by the skipped frames (Sly 2's
+            // FUN_0012a3d8 leaked 0x90 per skipped level and later returned
+            // through stale stack data).
+            Function func;
+            func.name = "recursive_func";
+            func.start = 0xC200;
+            func.end = 0xC220;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            Symbol self;
+            self.name = "recursive_func";
+            self.address = 0xC200;
+            self.size = 0x20;
+            self.isFunction = true;
+            self.isImported = false;
+            self.isExported = false;
+
+            Instruction entry = makeNop(0xC200);
+            Instruction recursiveJal = makeJal(0xC208, 0xC200);
+            Instruction delay = makeNop(0xC20C);
+
+            CodeGenerator gen({self}, {});
+            std::string generated = gen.generateFunction(func, {entry, recursiveJal, delay}, false);
+            printGeneratedCode("recursive JAL to a named function is a real call, not a goto", generated);
+
+            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, 0xC200u") != std::string::npos,
+                     "a recursive JAL should dispatch a new activation of the function");
+            t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::DirectCall") != std::string::npos,
+                     "a recursive JAL should be a direct call");
+            t.IsTrue(generated.find("goto label_c200;") == std::string::npos,
+                     "a recursive JAL must not re-enter the function with a goto");
+        });
+
         tc.Run("JALR emits indirect call", [](TestCase &t) {
             Function func;
             func.name = "jalr_test";
