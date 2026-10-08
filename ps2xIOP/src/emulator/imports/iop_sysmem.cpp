@@ -32,9 +32,10 @@ namespace ps2x::iop::detail
             // (which must be 256-aligned) in its block and frees it and exits
             // when the address is misaligned.
             constexpr uint32_t kSysmemBlockAlign = 256u;
-            const uint32_t address = a0 == 2u
-                                         ? m_memory.allocate(a1, 16u, a2)
-                                         : m_memory.allocate(a1, kSysmemBlockAlign);
+            // Mode 0 = ALLOC_FIRST, 1 = ALLOC_LAST (top of RAM), 2 = ALLOC_ADDRESS.
+            const uint32_t address = a0 == 2u   ? m_memory.allocate(a1, 16u, a2)
+                                     : a0 == 1u ? m_memory.allocateLast(a1, kSysmemBlockAlign)
+                                                : m_memory.allocate(a1, kSysmemBlockAlign);
             setV0(address);
             return true;
         }

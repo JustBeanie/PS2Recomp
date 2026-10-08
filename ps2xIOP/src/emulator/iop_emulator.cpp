@@ -774,7 +774,9 @@ namespace ps2x::iop::detail
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
     {
-        return m_impl->memory.allocate(size, alignment);
+        // EE-side requests (sceSifAllocIopHeap and friends) come from the top of
+        // IOP RAM, clear of module images loaded first-fit from the bottom.
+        return m_impl->memory.allocateLast(size, alignment);
     }
 
     bool IopEmulator::freeMemory(uint32_t address)

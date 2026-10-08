@@ -333,6 +333,40 @@ namespace ps2x::iop::detail
         return candidate;
     }
 
+    uint32_t IopMemory::allocateLast(uint32_t size, uint32_t alignment)
+    {
+        size = alignUp(std::max(size, 1u), 16u);
+        alignment = std::max<uint32_t>(alignment, 4u);
+        if (size > HeapLimit - HeapBase)
+            return 0u;
+
+        // Top-down search: each overlap moves the candidate below the blocking block.
+        uint32_t candidate = (HeapLimit - size) & ~(alignment - 1u);
+        for (;;)
+        {
+            if (candidate < HeapBase)
+                return 0u;
+            bool overlap = false;
+            for (const auto &block : m_allocations)
+            {
+                if (candidate < block.address + block.size && block.address < candidate + size)
+                {
+                    if (block.address < HeapBase + size)
+                        return 0u;
+                    candidate = (block.address - size) & ~(alignment - 1u);
+                    overlap = true;
+                    break;
+                }
+            }
+            if (!overlap)
+                break;
+        }
+        m_allocations.push_back({candidate, size});
+        markOwned(candidate, size);
+        m_heapCursor = std::max(m_heapCursor, candidate + size);
+        return candidate;
+    }
+
     bool IopMemory::freeAllocation(uint32_t address)
     {
         const auto block = std::find_if(m_allocations.begin(), m_allocations.end(),
