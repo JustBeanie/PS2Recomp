@@ -5,6 +5,7 @@
 #include "ps2_vu1_detail.h"
 
 #include <algorithm>
+#include <bit>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <limits>
 #include <ps2_log.h>
+
 
 namespace
 {
@@ -67,6 +69,13 @@ VU1Interpreter::VU1Interpreter(Unit unit)
 void VU1Interpreter::resetScheduler()
 {
     m_flagPipeline = {};
+    m_nextCommitCycle = UINT64_MAX;
+    m_flagLive = 0u;
+    m_efuLive = 0u;
+    m_storeLive = 0u;
+    m_vfWriteLive = 0u;
+    m_viWriteLive = 0u;
+    m_accWriteLive = 0u;
     m_fdiv = {};
     m_efu = {};
     m_storePipeline = {};
@@ -514,15 +523,8 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
         status |= flags;
     }
 
-    FlagPipelineEntry *entry = nullptr;
-    for (FlagPipelineEntry &candidate : m_flagPipeline)
-    {
-        if (!candidate.valid)
-        {
-            entry = &candidate;
-            break;
-        }
-    }
+    const uint32_t slot = allocateSlot(m_flagLive, kMaxFlagEntries);
+    FlagPipelineEntry *entry = slot < kMaxFlagEntries ? &m_flagPipeline[slot] : nullptr;
     if (!entry)
     {
         reportReservedInstruction(true, 0xFFFFFFFFu);
@@ -533,6 +535,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
     entry->valid = true;
     entry->issueCycle = m_cycle;
     entry->readyCycle = m_cycle + kFmacLatency;
+    noteReadyCycle(entry->readyCycle);
     entry->mac = mac;
     entry->status = status;
     entry->extraSticky = extraSticky;
@@ -564,14 +567,16 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
             entry.writesStatus = false;
     }
 
-    for (FlagPipelineEntry &entry : m_flagPipeline)
     {
-        if (!entry.valid)
+        const uint32_t slot = allocateSlot(m_flagLive, kMaxFlagEntries);
+        if (slot < kMaxFlagEntries)
         {
+            FlagPipelineEntry &entry = m_flagPipeline[slot];
             entry = {};
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
+            noteReadyCycle(entry.readyCycle);
             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
             entry.writesSticky = true;
             return;
@@ -583,14 +588,16 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
 void VU1Interpreter::queueClip(uint32_t clip)
 {
     m_workingClip = ((m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
-    for (FlagPipelineEntry &entry : m_flagPipeline)
     {
-        if (!entry.valid)
+        const uint32_t slot = allocateSlot(m_flagLive, kMaxFlagEntries);
+        if (slot < kMaxFlagEntries)
         {
+            FlagPipelineEntry &entry = m_flagPipeline[slot];
             entry = {};
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
+            noteReadyCycle(entry.readyCycle);
             entry.clip = m_workingClip;
             entry.writesClip = true;
             return;
@@ -607,14 +614,16 @@ void VU1Interpreter::queueFcset(uint32_t clip)
         if (entry.valid && entry.issueCycle == m_cycle)
             entry.writesClip = false;
     }
-    for (FlagPipelineEntry &entry : m_flagPipeline)
     {
-        if (!entry.valid)
+        const uint32_t slot = allocateSlot(m_flagLive, kMaxFlagEntries);
+        if (slot < kMaxFlagEntries)
         {
+            FlagPipelineEntry &entry = m_flagPipeline[slot];
             entry = {};
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
+            noteReadyCycle(entry.readyCycle);
             entry.clip = m_workingClip;
             entry.writesClip = true;
             return;
@@ -629,6 +638,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
     value = normalizeResult(value, ignoredFlags);
     m_fdiv.valid = true;
     m_fdiv.readyCycle = m_cycle + latency;
+    noteReadyCycle(m_fdiv.readyCycle);
     m_fdiv.value = value;
     m_fdiv.statusDi = statusDi & 0x30u;
 }
@@ -637,12 +647,14 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
 {
     uint32_t ignoredFlags = 0u;
     value = normalizeResult(value, ignoredFlags);
-    for (ScalarPipelineEntry &entry : m_efu)
     {
-        if (!entry.valid)
+        const uint32_t slot = allocateSlot(m_efuLive, 2u);
+        if (slot < 2u)
         {
+            ScalarPipelineEntry &entry = m_efu[slot];
             entry.valid = true;
             entry.readyCycle = m_cycle + latency;
+            noteReadyCycle(entry.readyCycle);
             entry.value = value;
             // EFU throughput is one cycle shorter than result visibility.
             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
@@ -654,12 +666,14 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
 
 void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
-    for (PendingStore &store : m_storePipeline)
     {
-        if (!store.valid)
+        const uint32_t slot = allocateSlot(m_storeLive, kMaxPendingStores);
+        if (slot < kMaxPendingStores)
         {
+            PendingStore &store = m_storePipeline[slot];
             store.valid = true;
             store.readyCycle = m_cycle + 1u;
+            noteReadyCycle(store.readyCycle);
             store.address = address;
             store.laneMask = laneMask;
             std::copy(words, words + 4, store.words.begin());
@@ -674,13 +688,15 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
 {
     if (reg == 0u || laneMask == 0u)
         return;
-    for (PendingVfWrite &write : m_vfWritePipeline)
     {
-        if (!write.valid)
+        const uint32_t slot = allocateSlot(m_vfWriteLive, kMaxPendingVfWrites);
+        if (slot < kMaxPendingVfWrites)
         {
+            PendingVfWrite &write = m_vfWritePipeline[slot];
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
+            noteReadyCycle(write.readyCycle);
             write.sequence = ++m_nextWriteSequence;
             write.reg = reg;
             write.laneMask = laneMask;
@@ -700,13 +716,15 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
 {
     if (reg == 0u)
         return;
-    for (PendingViWrite &write : m_viWritePipeline)
     {
-        if (!write.valid)
+        const uint32_t slot = allocateSlot(m_viWriteLive, kMaxPendingViWrites);
+        if (slot < kMaxPendingViWrites)
         {
+            PendingViWrite &write = m_viWritePipeline[slot];
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
+            noteReadyCycle(write.readyCycle);
             write.sequence = ++m_nextWriteSequence;
             write.reg = reg;
             write.value = value;
@@ -721,13 +739,15 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
 {
     if (laneMask == 0u)
         return;
-    for (PendingAccWrite &write : m_accWritePipeline)
     {
-        if (!write.valid)
+        const uint32_t slot = allocateSlot(m_accWriteLive, kMaxPendingAccWrites);
+        if (slot < kMaxPendingAccWrites)
         {
+            PendingAccWrite &write = m_accWritePipeline[slot];
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
+            noteReadyCycle(write.readyCycle);
             write.sequence = ++m_nextWriteSequence;
             write.laneMask = laneMask;
             std::copy(value, value + 4, write.value.begin());
@@ -744,9 +764,40 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
 
 void VU1Interpreter::commitReadyPipelines()
 {
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    // Nothing queued becomes ready before m_nextCommitCycle, so most cycles
+    // skip scanning every pipeline.
+    if (m_cycle < m_nextCommitCycle)
+        return;
+    commitDuePipelines();
+
+    uint64_t next = UINT64_MAX;
+    auto consider = [&](bool valid, uint64_t readyCycle)
     {
-        if (!entry.valid || entry.readyCycle > m_cycle)
+        if (valid && readyCycle < next)
+            next = readyCycle;
+    };
+    auto considerLive = [&](uint32_t live, const auto &pipeline)
+    {
+        for (; live != 0u; live &= live - 1u)
+            consider(true, pipeline[static_cast<uint32_t>(std::countr_zero(live))].readyCycle);
+    };
+    considerLive(m_flagLive, m_flagPipeline);
+    consider(m_fdiv.valid, m_fdiv.readyCycle);
+    considerLive(m_efuLive, m_efu);
+    considerLive(m_storeLive, m_storePipeline);
+    considerLive(m_vfWriteLive, m_vfWritePipeline);
+    considerLive(m_viWriteLive, m_viWritePipeline);
+    considerLive(m_accWriteLive, m_accWritePipeline);
+    m_nextCommitCycle = next;
+}
+
+void VU1Interpreter::commitDuePipelines()
+{
+    for (uint32_t live = m_flagLive; live != 0u; live &= live - 1u)
+    {
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(live));
+        FlagPipelineEntry &entry = m_flagPipeline[slot];
+        if (entry.readyCycle > m_cycle)
             continue;
 
         if (entry.writesMac)
@@ -763,6 +814,7 @@ void VU1Interpreter::commitReadyPipelines()
         if (entry.writesClip)
             m_state.clip = entry.clip;
         entry = {};
+        m_flagLive &= ~(1u << slot);
     }
 
     if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
@@ -773,18 +825,23 @@ void VU1Interpreter::commitReadyPipelines()
         m_fdiv = {};
     }
 
-    for (ScalarPipelineEntry &entry : m_efu)
+    for (uint32_t live = m_efuLive; live != 0u; live &= live - 1u)
     {
-        if (entry.valid && entry.readyCycle <= m_cycle)
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(live));
+        ScalarPipelineEntry &entry = m_efu[slot];
+        if (entry.readyCycle <= m_cycle)
         {
             m_state.p = entry.value;
             entry = {};
+            m_efuLive &= ~(1u << slot);
         }
     }
 
-    for (PendingStore &store : m_storePipeline)
+    for (uint32_t live = m_storeLive; live != 0u; live &= live - 1u)
     {
-        if (!store.valid || store.readyCycle > m_cycle)
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(live));
+        PendingStore &store = m_storePipeline[slot];
+        if (store.readyCycle > m_cycle)
             continue;
         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
         {
@@ -798,11 +855,14 @@ void VU1Interpreter::commitReadyPipelines()
             std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
         }
         store = {};
+        m_storeLive &= ~(1u << slot);
     }
 
-    for (PendingVfWrite &write : m_vfWritePipeline)
+    for (uint32_t live = m_vfWriteLive; live != 0u; live &= live - 1u)
     {
-        if (!write.valid || write.readyCycle > m_cycle)
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(live));
+        PendingVfWrite &write = m_vfWritePipeline[slot];
+        if (write.readyCycle > m_cycle)
             continue;
         for (uint32_t component = 0; component < 4u; ++component)
         {
@@ -813,20 +873,26 @@ void VU1Interpreter::commitReadyPipelines()
             }
         }
         write = {};
+        m_vfWriteLive &= ~(1u << slot);
     }
 
-    for (PendingViWrite &write : m_viWritePipeline)
+    for (uint32_t live = m_viWriteLive; live != 0u; live &= live - 1u)
     {
-        if (!write.valid || write.readyCycle > m_cycle)
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(live));
+        PendingViWrite &write = m_viWritePipeline[slot];
+        if (write.readyCycle > m_cycle)
             continue;
         if (m_viLatestWrite[write.reg] == write.sequence)
             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
         write = {};
+        m_viWriteLive &= ~(1u << slot);
     }
 
-    for (PendingAccWrite &write : m_accWritePipeline)
+    for (uint32_t live = m_accWriteLive; live != 0u; live &= live - 1u)
     {
-        if (!write.valid || write.readyCycle > m_cycle)
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(live));
+        PendingAccWrite &write = m_accWritePipeline[slot];
+        if (write.readyCycle > m_cycle)
             continue;
         for (uint32_t component = 0; component < 4u; ++component)
         {
@@ -837,6 +903,7 @@ void VU1Interpreter::commitReadyPipelines()
             }
         }
         write = {};
+        m_accWriteLive &= ~(1u << slot);
     }
 }
 
@@ -957,27 +1024,8 @@ void VU1Interpreter::advanceTo(uint64_t targetCycle)
 
 bool VU1Interpreter::pipelinesPending() const
 {
-    if (m_fdiv.valid || m_xgkick.active)
-        return true;
-    for (const ScalarPipelineEntry &entry : m_efu)
-        if (entry.valid)
-            return true;
-    for (const FlagPipelineEntry &entry : m_flagPipeline)
-        if (entry.valid)
-            return true;
-    for (const PendingStore &store : m_storePipeline)
-        if (store.valid)
-            return true;
-    for (const PendingVfWrite &write : m_vfWritePipeline)
-        if (write.valid)
-            return true;
-    for (const PendingViWrite &write : m_viWritePipeline)
-        if (write.valid)
-            return true;
-    for (const PendingAccWrite &write : m_accWritePipeline)
-        if (write.valid)
-            return true;
-    return false;
+    return m_fdiv.valid || m_xgkick.active ||
+           (m_efuLive | m_flagLive | m_storeLive | m_vfWriteLive | m_viWriteLive | m_accWriteLive) != 0u;
 }
 
 void VU1Interpreter::flushPipelines()
@@ -1005,11 +1053,8 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
                     ready = std::max(ready, m_vfReady[access.reg][component]);
             }
         }
-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
-        {
-            if ((usage->viRead & (1u << reg)) != 0u)
-                ready = std::max(ready, m_viReady[reg]);
-        }
+        for (uint32_t viRead = usage->viRead & 0xFFFEu; viRead != 0u; viRead &= viRead - 1u)
+            ready = std::max(ready, m_viReady[static_cast<uint32_t>(std::countr_zero(viRead))]);
         for (uint32_t component = 0; component < 4u; ++component)
         {
             if ((usage->accRead & laneForComponent(component)) != 0u)
@@ -1025,9 +1070,8 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
         ready = std::max(ready, m_fdiv.readyCycle);
     if (decoded.lowerUsage.waitP)
     {
-        for (const ScalarPipelineEntry &entry : m_efu)
-            if (entry.valid)
-                ready = std::max(ready, entry.readyCycle);
+        for (uint32_t live = m_efuLive; live != 0u; live &= live - 1u)
+            ready = std::max(ready, m_efu[static_cast<uint32_t>(std::countr_zero(live))].readyCycle);
     }
     if (decoded.lowerUsage.pipeline == PipelineXgkick && m_xgkick.active)
         ready = std::max(ready, m_cycle + 1u);
@@ -1063,11 +1107,9 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
         }
     }
 
-    for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
-    {
-        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
-            m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
-    }
+    const uint32_t viLatency = decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency;
+    for (uint32_t viWrite = decoded.lowerUsage.viWrite & 0xFFFEu; viWrite != 0u; viWrite &= viWrite - 1u)
+        m_viReady[static_cast<uint32_t>(std::countr_zero(viWrite))] = m_cycle + viLatency;
     for (uint32_t component = 0; component < 4u; ++component)
     {
         if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)

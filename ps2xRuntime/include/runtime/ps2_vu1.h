@@ -2,6 +2,7 @@
 #define PS2_VU1_H
 
 #include <array>
+#include <bit>
 #include <cstdint>
 
 class GS;
@@ -228,6 +229,15 @@ private:
     uint64_t m_cycle = 0;
     uint64_t m_nextWriteSequence = 0;
     uint64_t m_efuResourceReady = 0;
+    uint64_t m_nextCommitCycle = 0; // earliest readyCycle among queued pipeline entries
+    // Bit i set = slot i of the matching pipeline array holds a queued entry.
+    // Loops walk set bits in ascending slot order, matching the old full scans.
+    uint32_t m_flagLive = 0;
+    uint32_t m_efuLive = 0;
+    uint32_t m_storeLive = 0;
+    uint32_t m_vfWriteLive = 0;
+    uint32_t m_viWriteLive = 0;
+    uint32_t m_accWriteLive = 0;
     uint32_t m_workingClip = 0;
     uint32_t m_currentUpperInstruction = 0;
     int32_t m_viBranchBackupValue = 0;
@@ -279,6 +289,22 @@ private:
 
     void resetScheduler();
     void commitReadyPipelines();
+    void commitDuePipelines();
+    // Claims the lowest free slot; returns capacity when the pipeline is full.
+    static uint32_t allocateSlot(uint32_t &live, uint32_t capacity)
+    {
+        const uint32_t freeSlots = ~live & ((1u << capacity) - 1u);
+        if (freeSlots == 0u)
+            return capacity;
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(freeSlots));
+        live |= 1u << slot;
+        return slot;
+    }
+    void noteReadyCycle(uint64_t readyCycle)
+    {
+        if (readyCycle < m_nextCommitCycle)
+            m_nextCommitCycle = readyCycle;
+    }
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
