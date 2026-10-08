@@ -1,5 +1,9 @@
 #include "Common.h"
 #include "Pad.h"
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace ps2_stubs
 {
@@ -92,6 +96,85 @@ namespace ps2_stubs
                 }
             }
             return -1;
+        }
+
+        // PS2X_PAD_SCRIPT="t:button[+button...][,t:...]" presses buttons for 0.3 s
+        // at t seconds after the first pad read (port 0), e.g. "40:square,55:start".
+        // Lets scripted boots get through menus without a person at the keyboard.
+        struct ScriptedPress
+        {
+            double seconds = 0.0;
+            uint16_t mask = 0u;
+        };
+
+        uint16_t padButtonFromName(const std::string &name)
+        {
+            static const std::pair<const char *, uint16_t> kNames[] = {
+                {"select", kPadBtnSelect}, {"l3", kPadBtnL3}, {"r3", kPadBtnR3}, {"start", kPadBtnStart},
+                {"up", kPadBtnUp}, {"right", kPadBtnRight}, {"down", kPadBtnDown}, {"left", kPadBtnLeft},
+                {"l2", kPadBtnL2}, {"r2", kPadBtnR2}, {"l1", kPadBtnL1}, {"r1", kPadBtnR1},
+                {"triangle", kPadBtnTriangle}, {"circle", kPadBtnCircle}, {"cross", kPadBtnCross}, {"square", kPadBtnSquare},
+            };
+            for (const auto &[label, mask] : kNames)
+            {
+                if (name == label)
+                    return mask;
+            }
+            return 0u;
+        }
+
+        const std::vector<ScriptedPress> &scriptedPresses()
+        {
+            static const std::vector<ScriptedPress> presses = []()
+            {
+                std::vector<ScriptedPress> result;
+                const char *env = std::getenv("PS2X_PAD_SCRIPT");
+                if (!env)
+                    return result;
+                std::string script(env);
+                size_t start = 0;
+                while (start < script.size())
+                {
+                    const size_t end = std::min(script.find(',', start), script.size());
+                    const std::string entry = script.substr(start, end - start);
+                    start = end + 1;
+                    const size_t colon = entry.find(':');
+                    if (colon == std::string::npos)
+                        continue;
+                    ScriptedPress press;
+                    press.seconds = std::atof(entry.substr(0, colon).c_str());
+                    std::string buttons = entry.substr(colon + 1);
+                    size_t b = 0;
+                    while (b <= buttons.size())
+                    {
+                        const size_t plus = std::min(buttons.find('+', b), buttons.size());
+                        std::string name = buttons.substr(b, plus - b);
+                        std::transform(name.begin(), name.end(), name.begin(),
+                                       [](unsigned char c)
+                                       { return static_cast<char>(std::tolower(c)); });
+                        press.mask = static_cast<uint16_t>(press.mask | padButtonFromName(name));
+                        b = plus + 1;
+                    }
+                    if (press.mask != 0u)
+                        result.push_back(press);
+                }
+                return result;
+            }();
+            return presses;
+        }
+
+        void applyScriptedState(PadInputState &state, int port)
+        {
+            const std::vector<ScriptedPress> &presses = scriptedPresses();
+            if (presses.empty() || port != 0)
+                return;
+            static const auto firstRead = std::chrono::steady_clock::now();
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - firstRead).count();
+            for (const ScriptedPress &press : presses)
+            {
+                if (now >= press.seconds && now < press.seconds + 0.3)
+                    state.buttons = static_cast<uint16_t>(state.buttons & ~press.mask);
+            }
         }
 
         void applyGamepadState(PadInputState &state)
@@ -313,6 +396,7 @@ namespace ps2_stubs
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
                 }
+                applyScriptedState(state, port);
             }
 
             fillPadStatus(outData, state, portState);
