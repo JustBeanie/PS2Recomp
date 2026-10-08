@@ -7,6 +7,9 @@
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <condition_variable>
+#include <cstdlib>
+#include <thread>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -19,6 +22,33 @@ using namespace GSInternal;
 
 namespace
 {
+    // Rows a raster worker owns: interleaved 8-row bands (one PSMCT32 block
+    // tall), so neighbouring workers rarely share VRAM cache lines.
+    constexpr int kRasterBandShift = 3;
+    thread_local uint32_t t_bandIndex = 0u;
+    thread_local uint32_t t_bandCount = 1u;
+    thread_local GSMem::TexturePageCache *t_textureCache = nullptr;
+
+    inline bool ownsRow(int y)
+    {
+        return t_bandCount == 1u ||
+               (static_cast<uint32_t>(y >> kRasterBandShift) % t_bandCount) == t_bandIndex;
+    }
+
+    // Framebuffer formats whose pixels never share bytes with another row's pixels.
+    inline bool frameSupportsBandedRaster(uint32_t fpsm)
+    {
+        return fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT24 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S;
+    }
+
+    uint32_t rasterWorkerCountFromEnvironment()
+    {
+        if (const char *env = std::getenv("PS2X_GS_THREADS"))
+            return static_cast<uint32_t>(std::max(0, std::atoi(env)));
+        const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
+        // Leave room for the EE/VU thread and the host presentation thread.
+        return std::min<uint32_t>(12u, hw > 3u ? hw - 2u : 1u);
+    }
     float fabsQ(float q)
     {
         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
@@ -511,6 +541,114 @@ GSCpuBackend::GSCpuBackend()
         }
     }
     Reset();
+    StartWorkers(rasterWorkerCountFromEnvironment());
+}
+
+GSCpuBackend::~GSCpuBackend()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        DrainDraws();
+    }
+    StopWorkers();
+}
+
+void GSCpuBackend::StartWorkers(uint32_t count)
+{
+    if (count <= 1u)
+        return; // serial: draws run on the submitting thread
+    m_workers.reserve(count);
+    for (uint32_t i = 0; i < count; ++i)
+        m_workers.push_back(std::make_unique<RasterWorker>());
+    for (uint32_t i = 0; i < count; ++i)
+        m_workers[i]->thread = std::thread([this, i]()
+                                           { WorkerMain(i); });
+}
+
+void GSCpuBackend::StopWorkers()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_workMutex);
+        m_stopWorkers = true;
+    }
+    m_workCv.notify_all();
+    for (auto &worker : m_workers)
+    {
+        if (worker->thread.joinable())
+            worker->thread.join();
+    }
+    m_workers.clear();
+}
+
+void GSCpuBackend::WorkerMain(uint32_t index)
+{
+    RasterWorker &self = *m_workers[index];
+    t_bandIndex = index;
+    t_bandCount = static_cast<uint32_t>(m_workers.size());
+    t_textureCache = &self.textureCache;
+
+    uint64_t seenGeneration = 0;
+    for (;;)
+    {
+        uint64_t epoch = 0;
+        {
+            std::unique_lock<std::mutex> lock(m_workMutex);
+            m_workCv.wait(lock, [&]()
+                          { return m_stopWorkers || m_workGeneration != seenGeneration; });
+            if (m_stopWorkers)
+                return;
+            seenGeneration = m_workGeneration;
+            epoch = m_textureCacheEpoch;
+        }
+
+        if (self.textureCacheEpoch != epoch)
+        {
+            self.textureCache.Invalidate();
+            self.textureCacheEpoch = epoch;
+        }
+        for (const GSPrimitiveBatch &batch : m_activeDraws)
+            DrawPrimitive(batch);
+
+        {
+            std::lock_guard<std::mutex> lock(m_workMutex);
+            if (++m_workersDone == m_workers.size())
+                m_doneCv.notify_all();
+        }
+    }
+}
+
+void GSCpuBackend::WaitForDraws()
+{
+    std::unique_lock<std::mutex> lock(m_workMutex);
+    m_doneCv.wait(lock, [&]()
+                  { return !m_batchInFlight || m_workersDone == m_workers.size(); });
+    m_batchInFlight = false;
+}
+
+void GSCpuBackend::KickPendingDraws()
+{
+    if (m_pendingDraws.empty())
+        return;
+    // One batch in flight at a time: the submitter keeps queueing the next
+    // batch while the workers rasterize this one.
+    WaitForDraws();
+    {
+        std::lock_guard<std::mutex> lock(m_workMutex);
+        m_activeDraws.swap(m_pendingDraws);
+        m_workersDone = 0u;
+        m_batchInFlight = true;
+        ++m_workGeneration;
+    }
+    m_workCv.notify_all();
+    m_pendingDraws.clear();
+}
+
+void GSCpuBackend::DrainDraws()
+{
+    if (m_workers.empty())
+        return;
+    KickPendingDraws();
+    WaitForDraws();
 }
 
 void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
@@ -527,6 +665,7 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 void GSCpuBackend::Reset()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    DrainDraws();
     ResetUnlocked();
 }
 
@@ -548,12 +687,22 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
         return;
-    DrawPrimitive(batch);
+    if (m_workers.empty() || !frameSupportsBandedRaster(batch.state.context.frame.psm))
+    {
+        DrainDraws();
+        DrawPrimitive(batch);
+        return;
+    }
+    constexpr size_t kDrawBatchSize = 128u;
+    m_pendingDraws.push_back(batch);
+    if (m_pendingDraws.size() >= kDrawBatchSize)
+        KickPendingDraws();
 }
 
 void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    DrainDraws();
     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
         return;
 
@@ -638,23 +787,30 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
 
 void GSCpuBackend::Flush()
 {
-    // CPU backend is immediate. GPU backends may submit command buffers here.
+    std::lock_guard<std::mutex> lock(m_mutex);
+    DrainDraws();
 }
 
 void GSCpuBackend::TextureFlush()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    // TEXFLUSH: draws queued before it must land in VRAM before anything samples it.
+    DrainDraws();
     m_texturePageCache.Invalidate();
+    std::lock_guard<std::mutex> workLock(m_workMutex);
+    ++m_textureCacheEpoch;
 }
 
 void GSCpuBackend::Sync(GSSyncReason)
 {
-    // CPU backend is immediate. GPU backends may wait on fences/readbacks here.
+    std::lock_guard<std::mutex> lock(m_mutex);
+    DrainDraws();
 }
 
 uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    const_cast<GSCpuBackend *>(this)->DrainDraws();
     return ReadVramUnlocked(psm, base, bw, x, y);
 }
 
@@ -670,12 +826,14 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
     if (!m_vram)
         return 0u;
 
-    return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
+    GSMem::TexturePageCache &cache = t_textureCache ? *t_textureCache : m_texturePageCache;
+    return GSMem::ReadTexture(cache, m_vram, psm, base, bw, x, y);
 }
 
 void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    DrainDraws();
     WriteVramUnlocked(psm, base, bw, x, y, value);
 }
 
@@ -689,6 +847,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
 void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    const_cast<GSCpuBackend *>(this)->DrainDraws();
     if (!m_vram || m_vramSize == 0u)
     {
         out.clear();
@@ -1236,6 +1395,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
 
         for (int y = drawY0; y <= drawY1; ++y)
         {
+            if (!ownsRow(y))
+                continue;
             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
             float texVf = v0f + (v1f - v0f) * ty;
 
@@ -1270,8 +1431,12 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     else
     {
         for (int y = drawY0; y <= drawY1; ++y)
+        {
+            if (!ownsRow(y))
+                continue;
             for (int x = drawX0; x <= drawX1; ++x)
                 WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
+        }
     }
 }
 
@@ -1313,6 +1478,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
 
     for (int y = minY; y <= maxY; ++y)
     {
+        if (!ownsRow(y))
+            continue;
         float py = static_cast<float>(y) + 0.5f;
         for (int x = minX; x <= maxX; ++x)
         {
@@ -1440,7 +1607,8 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 
         double z = (v0.z + (v1.z - v0.z) * t);
         const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
-        WritePixel(state, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
+        if (ownsRow(y0))
+            WritePixel(state, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
 
         if (x0 == x1 && y0 == y1)
             break;
@@ -1463,6 +1631,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    DrainDraws();
     m_transfer = command;
     m_transferState.x = command.trxpos.dsax;
     m_transferState.y = command.trxpos.dsay;
@@ -1480,6 +1649,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    DrainDraws();
     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
         return;
     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
@@ -1709,6 +1879,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    DrainDraws();
     if (!m_vram || context.frame.fbw == 0u)
         return false;
 

@@ -4,13 +4,17 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 class GSCpuBackend final : public GSRasterBackend
 {
 public:
     GSCpuBackend();
+    ~GSCpuBackend() override;
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
@@ -34,6 +38,24 @@ public:
     GSTransferSnapshot GetTransferSnapshot() const override;
 
 private:
+    // Draws are queued and rasterized by worker threads, each owning interleaved
+    // 8-row bands of every primitive, so per-pixel submission order is kept and no
+    // two workers write the same pixel. Every operation that reads or writes VRAM
+    // outside a draw first drains the queue (DrainDraws).
+    struct RasterWorker
+    {
+        std::thread thread;
+        GSMem::TexturePageCache textureCache;
+        uint64_t textureCacheEpoch = 0;
+    };
+
+    void StartWorkers(uint32_t count);
+    void StopWorkers();
+    void WorkerMain(uint32_t index);
+    void KickPendingDraws();
+    void WaitForDraws();
+    void DrainDraws();
+
     void ResetUnlocked();
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
@@ -78,4 +100,16 @@ private:
     GSTransferSnapshot m_transferState{};
     std::vector<uint8_t> m_localToHostBuffer;
     size_t m_localToHostReadPos = 0;
+
+    std::vector<std::unique_ptr<RasterWorker>> m_workers;
+    std::vector<GSPrimitiveBatch> m_pendingDraws; // filled by Submit
+    std::vector<GSPrimitiveBatch> m_activeDraws;  // being rasterized by the workers
+    std::mutex m_workMutex;
+    std::condition_variable m_workCv;
+    std::condition_variable m_doneCv;
+    uint64_t m_workGeneration = 0;
+    uint32_t m_workersDone = 0;
+    bool m_batchInFlight = false;
+    bool m_stopWorkers = false;
+    uint64_t m_textureCacheEpoch = 0; // bumped by TEXFLUSH; workers invalidate on change
 };

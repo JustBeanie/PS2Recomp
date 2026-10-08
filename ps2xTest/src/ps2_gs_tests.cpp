@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include <cstdlib>
 #include "runtime/ps2_memory.h"
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
@@ -773,6 +774,71 @@ void register_ps2_gs_tests()
                      "XYZ3 should suppress the completed ABC triangle");
             t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 4u, 4u), kColor,
                      "the next XYZ2 should draw BCD from the advanced strip queue");
+        });
+
+        tc.Run("banded multithreaded rasterizer matches the serial rasterizer", [](TestCase &t)
+        {
+            // Overlapping alpha-blended triangles: any reordering between bands or a
+            // missed drain shows up as a pixel difference against the serial result.
+            auto render = [](const char *threads) -> std::vector<uint8_t>
+            {
+#if defined(_WIN32)
+                _putenv_s("PS2X_GS_THREADS", threads);
+#else
+                setenv("PS2X_GS_THREADS", threads, 1);
+#endif
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+                gs.writeRegister(GS_REG_FRAME_1, (4ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                gs.writeRegister(GS_REG_ZBUF_1, (0x80ull) | (1ull << 32));
+                gs.writeRegister(GS_REG_SCISSOR_1, (255ull << 16) | (255ull << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_ALPHA_1, 0x44ull); // (Cs - Cd) * As + Cd
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE) | (1ull << 3) | (1ull << 6));
+
+                uint32_t seed = 0x1234567u;
+                auto next = [&seed]()
+                {
+                    seed = seed * 1664525u + 1013904223u;
+                    return seed >> 8;
+                };
+                for (int tri = 0; tri < 600; ++tri)
+                {
+                    for (int v = 0; v < 3; ++v)
+                    {
+                        const uint64_t rgba = static_cast<uint64_t>(next() & 0xFFFFFFu) |
+                                              (static_cast<uint64_t>(next() & 0x7Fu) << 24);
+                        gs.writeRegister(GS_REG_RGBAQ, rgba);
+                        const uint64_t x = static_cast<uint64_t>(next() % (256u * 16u));
+                        const uint64_t y = static_cast<uint64_t>(next() % (256u * 16u));
+                        gs.writeRegister(GS_REG_XYZ2, x | (y << 16));
+                    }
+                }
+                gs.refreshDisplaySnapshot(); // drains queued draws
+                return vram;
+            };
+
+            const std::vector<uint8_t> serial = render("1");
+            const std::vector<uint8_t> banded = render("4");
+#if defined(_WIN32)
+            _putenv_s("PS2X_GS_THREADS", "1");
+#else
+            setenv("PS2X_GS_THREADS", "1", 1);
+#endif
+            bool drewSomething = false;
+            for (uint8_t b : serial)
+            {
+                if (b != 0u)
+                {
+                    drewSomething = true;
+                    break;
+                }
+            }
+            t.IsTrue(drewSomething, "the serial reference should draw pixels");
+            t.IsTrue(serial == banded, "4 raster workers should produce byte-identical VRAM to the serial rasterizer");
         });
 
         tc.Run("GS fog blends the shaded color toward FOGCOL before framebuffer blending", [](TestCase &t)

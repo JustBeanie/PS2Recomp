@@ -22,6 +22,17 @@ void reset_ps2_test_function_table();
 
 int main()
 {
+    // Most GS tests read raw VRAM right after a draw, so default to the serial
+    // rasterizer; the banded-rasterizer test switches worker counts itself.
+    if (!std::getenv("PS2X_GS_THREADS"))
+    {
+#if defined(_WIN32)
+        _putenv_s("PS2X_GS_THREADS", "1");
+#else
+        setenv("PS2X_GS_THREADS", "1", 1);
+#endif
+    }
+
     MiniTest::BeforeEach(reset_ps2_test_function_table);
 
     register_code_generator_tests();
