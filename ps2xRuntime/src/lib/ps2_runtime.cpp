@@ -481,7 +481,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        // The EE scheduler latches the displayed frame at each guest vblank;
+        // only the very first frame is latched here so the window is not empty.
+        if (!s_hasLatchedInitialFrame)
+            rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -2641,9 +2644,17 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        // The PS2 always drives a 4:3 TV picture whatever the framebuffer size
+        // (e.g. 512x224 fields are line-doubled), so fit a 4:3 box, not the
+        // framebuffer's own ratio.
+        constexpr float kDisplayAspect = 4.0f / 3.0f;
+        float dstWidth = screenWidth;
+        float dstHeight = screenWidth / kDisplayAspect;
+        if (dstHeight > screenHeight)
+        {
+            dstHeight = screenHeight;
+            dstWidth = screenHeight * kDisplayAspect;
+        }
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,

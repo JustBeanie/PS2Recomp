@@ -1867,6 +1867,13 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+        // Latch what the CRT would scan out now, on the guest's clock. GS work
+        // runs inside the synchronous DMA calls without advancing emulated time,
+        // so a frame drawn after the previous vblank is complete here even when
+        // the host is far slower than real time. Latching on the host's own
+        // schedule instead caught single-buffered games (Sly 2 draws into the
+        // displayed buffer) mid-frame: mostly-black, flickering output.
+        m_runtime.gs().latchHostPresentationFrame();
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
