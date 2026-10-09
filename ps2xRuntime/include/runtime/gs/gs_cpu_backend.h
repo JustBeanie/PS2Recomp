@@ -65,6 +65,7 @@ private:
     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
 
     void DrawPrimitive(const GSPrimitiveBatch &batch);
+    void DumpTextureOnce(const GSDrawState &state);
     void DrawSprite(const GSPrimitiveBatch &batch);
     void DrawTriangle(const GSPrimitiveBatch &batch);
     void DrawLine(const GSPrimitiveBatch &batch);

@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <thread>
+#include <unordered_set>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -78,6 +79,33 @@ namespace
         const uint32_t pagesPerRow = std::max<uint32_t>(1u, (widthPixels + pageW - 1u) / pageW);
         first = basePage + (y0 / pageH) * pagesPerRow;
         last = basePage + (y1 / pageH) * pagesPerRow + pagesPerRow - 1u;
+    }
+
+    // PS2X_GS_PRIM_LOG=start:count[:stride] logs primitives start..start+count
+    // (every stride-th); default is the first 64. Use with PS2X_GS_THREADS=1:
+    // banded workers each run every primitive, so indices would repeat.
+    bool primitiveLogWanted(uint32_t index)
+    {
+        struct Window
+        {
+            uint32_t start = 0u, count = 64u, stride = 1u;
+        };
+        static const Window window = []()
+        {
+            Window w;
+            if (const char *env = std::getenv("PS2X_GS_PRIM_LOG"))
+            {
+                char *end = nullptr;
+                w.start = static_cast<uint32_t>(std::strtoul(env, &end, 0));
+                if (end && *end == ':')
+                    w.count = static_cast<uint32_t>(std::strtoul(end + 1, &end, 0));
+                if (end && *end == ':')
+                    w.stride = std::max<uint32_t>(1u, static_cast<uint32_t>(std::strtoul(end + 1, &end, 0)));
+            }
+            return w;
+        }();
+        return index >= window.start && index - window.start < window.count &&
+               (index - window.start) % window.stride == 0u;
     }
 
     uint32_t rasterWorkerCountFromEnvironment()
@@ -980,13 +1008,64 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
     return result;
 }
 
+// PS2X_GS_DUMP_TEXTURES=<dir>: write each distinct texture a draw samples as
+// <dir>/tex_<tbp0>_<psm>_<cbp>_<w>x<h>.rgba (8-byte header: width, height as
+// uint32, then RGBA8 rows), decoded through SampleTexture so CLUTs apply.
+// Convert with tools/rgba_to_png.py. Use with PS2X_GS_THREADS=1.
+void GSCpuBackend::DumpTextureOnce(const GSDrawState &state)
+{
+    static const char *dir = std::getenv("PS2X_GS_DUMP_TEXTURES");
+    if (!dir || !*dir)
+        return;
+    static std::mutex dumpMutex;
+    static std::unordered_set<uint64_t> seen;
+    const auto &tex = state.context.tex0;
+    const uint32_t width = std::max<uint32_t>(state.textureWidth, 1u);
+    const uint32_t height = std::max<uint32_t>(state.textureHeight, 1u);
+    const uint64_t key = (static_cast<uint64_t>(tex.tbp0) << 40) ^ (static_cast<uint64_t>(tex.psm) << 32) ^
+                         (static_cast<uint64_t>(tex.cbp) << 12) ^ (static_cast<uint64_t>(tex.csa) << 6) ^ (width * 3u + height);
+    {
+        std::lock_guard<std::mutex> lock(dumpMutex);
+        if (seen.size() >= 2000u || !seen.insert(key).second)
+            return;
+    }
+    if (width > 1024u || height > 1024u)
+        return;
+
+    GSDrawState probe = state;
+    probe.prim.fst = true;
+    probe.context.tex1 = 0u;                  // nearest
+    probe.context.clamp = 0x1u | (0x1u << 2); // clamp to edge
+    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4u);
+    for (uint32_t y = 0; y < height; ++y)
+    {
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            const uint32_t texel = SampleTexture(probe, 0.0f, 0.0f, 1.0f,
+                                                 static_cast<uint16_t>((x << 4) + 8u), static_cast<uint16_t>((y << 4) + 8u));
+            std::memcpy(pixels.data() + (static_cast<size_t>(y) * width + x) * 4u, &texel, 4u);
+        }
+    }
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s/tex_%05u_%02x_%05u_%ux%u.rgba", dir, tex.tbp0, tex.psm, tex.cbp, width, height);
+    if (FILE *f = std::fopen(path, "wb"))
+    {
+        std::fwrite(&width, 4, 1, f);
+        std::fwrite(&height, 4, 1, f);
+        std::fwrite(pixels.data(), 1, pixels.size(), f);
+        std::fclose(f);
+    }
+}
+
 void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
+    if (state.prim.tme)
+        DumpTextureOnce(state);
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
-        if (primitiveIndex < 64u)
+        if (primitiveLogWanted(primitiveIndex))
         {
             std::cout << "[gs:prim] idx=" << primitiveIndex
                       << " type=" << static_cast<uint32_t>(state.prim.type)
@@ -1033,6 +1112,9 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
                       << " v2=(" << batch.vertices[2].x << "," << batch.vertices[2].y << ")"
                       << " uv2=(" << (batch.vertices[2].u >> 4) << "," << (batch.vertices[2].v >> 4) << ")"
                       << " stq2=(" << batch.vertices[2].s << "," << batch.vertices[2].t << "," << batch.vertices[2].q << ")"
+                      << " z=(" << std::fixed << batch.vertices[0].z << "," << batch.vertices[1].z << "," << batch.vertices[2].z << ")" << std::defaultfloat
+                      << " zbuf=(zbp=" << ctx.zbuf.zbp << " psm=0x" << std::hex << static_cast<uint32_t>(ctx.zbuf.psm) << std::dec
+                      << " zmsk=" << static_cast<uint32_t>(ctx.zbuf.zmask) << ")"
                       << " rgba0=(" << static_cast<uint32_t>(batch.vertices[0].r) << ","
                       << static_cast<uint32_t>(batch.vertices[0].g) << ","
                       << static_cast<uint32_t>(batch.vertices[0].b) << ","
@@ -1180,6 +1262,13 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
     {
         return;
     }
+
+    // Depth is clamped to what the Z buffer format holds (PCSX2 does the same);
+    // storing an unclamped value would wrap it in a 24/16-bit buffer.
+    if (zpsm == GS_PSM_Z24)
+        z = static_cast<int>(std::min<uint32_t>(static_cast<uint32_t>(z), 0x00FFFFFFu));
+    else if (zpsm == GS_PSM_Z16 || zpsm == GS_PSM_Z16S)
+        z = static_cast<int>(std::min<uint32_t>(static_cast<uint32_t>(z), 0x0000FFFFu));
 
     bool zpass = false;
     uint32_t storedZ = 0u;
