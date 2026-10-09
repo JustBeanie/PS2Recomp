@@ -2216,6 +2216,31 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "raw image continuation after packed setup should not be decoded as VIF/GIF registers");
         });
 
+        tc.Run("VIF1 UNPACK V4-5 expands RGBA5551 to 8-bit channels", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x01u, 0u, 0x0101u)); // STCYCL CL=1 WL=1
+            appendU32(packet, makeVifCmd(0x6Fu, 2u, 0u));      // UNPACK V4-5, 2 vectors to VU1 qword 0
+            appendU32(packet, 0x7C1Fu | (0x83E0u << 16));     // R=31,B=31,A=0 ; G=31,A=1
+
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            uint32_t first[4]{};
+            uint32_t second[4]{};
+            std::memcpy(first, mem.getVU1Data(), sizeof(first));
+            std::memcpy(second, mem.getVU1Data() + 16, sizeof(second));
+            t.Equals(first[0], 0xF8u, "R5 should expand to R << 3");
+            t.Equals(first[1], 0u, "G should be zero in the first vector");
+            t.Equals(first[2], 0xF8u, "B5 should expand to B << 3");
+            t.Equals(first[3], 0u, "A1=0 should expand to 0");
+            t.Equals(second[1], 0xF8u, "G5 should expand to G << 3");
+            t.Equals(second[3], 0x80u, "A1=1 should expand to 0x80");
+        });
+
         tc.Run("VIF1 DIRECT image data can arrive in the next DIRECT", [](TestCase &t)
         {
             PS2Memory mem;
