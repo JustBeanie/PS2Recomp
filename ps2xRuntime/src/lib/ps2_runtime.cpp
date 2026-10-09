@@ -1566,10 +1566,27 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
 
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
+    // Run to the E-bit like VU1: a fixed cycle budget would cut longer routines
+    // short and hand partial results back to the EE.
+    constexpr uint32_t kSliceCycles = 65536u;
+    constexpr int kMaxSlices = 256;
     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
                   vu0Data, PS2_VU0_DATA_SIZE,
                   m_gs, &m_memory,
-                  startPC, 0u, ctx->vu0_itop, 4096);
+                  startPC, 0u, ctx->vu0_itop, kSliceCycles);
+    for (int slices = 1; m_vu0.state().running && slices < kMaxSlices; ++slices)
+    {
+        m_vu0.resume(vu0Code, PS2_VU0_CODE_SIZE,
+                     vu0Data, PS2_VU0_DATA_SIZE,
+                     m_gs, &m_memory, 0u, ctx->vu0_itop, kSliceCycles);
+    }
+    if (m_vu0.state().running)
+    {
+        static uint32_t warned = 0;
+        if (warned++ < 8)
+            std::cerr << "[VU0] microprogram at 0x" << std::hex << startPC << " still running at pc=0x"
+                      << m_vu0.state().pc << std::dec << "; abandoning (possible infinite loop)" << std::endl;
+    }
     copyVu0StateToContext(m_vu0.state(), ctx);
 }
 
