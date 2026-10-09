@@ -2620,6 +2620,11 @@ void PS2Runtime::run()
                                                << " gp=0x" << dbgGp
                                                << " dispfb1=0x" << gs.dispfb1
                                                << " display1=0x" << gs.display1
+                                               << " dispfb2=0x" << gs.dispfb2
+                                               << " display2=0x" << gs.display2
+                                               << " pmode=0x" << gs.pmode
+                                               << " smode2=0x" << gs.smode2
+                                               << " bgcolor=0x" << gs.bgcolor
                                                << std::dec
                                                << " activeThreads=" << eeSnapshot.threads.size()
                                                << " dma=" << curDma
