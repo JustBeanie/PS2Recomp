@@ -68,6 +68,8 @@ namespace ps2recomp
         return fmt::format("{{ __m128 res = PS2_VMUL(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); __m128i mask = _mm_set_epi32({}, {}, {}, {}); ctx->vu0_vf[{}] = PS2_VBLEND(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}", vfs, vft, (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0, (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, vfd, vfd);
     }
 
+    // VDIV/VSQRT/VRSQRT follow the EE FPU rules (no Inf/NaN): a zero divisor gives
+    // +-FLT_MAX with the xor of the signs, and square roots use |ft| (PCSX2 VU_DIV etc.).
     std::string CodeGenerator::translateVU_VDIV(const Instruction &inst)
     {
         uint8_t fsf = inst.vectorInfo.fsf;
@@ -75,21 +77,23 @@ namespace ps2recomp
         uint8_t fs_reg = inst.rd;
         uint8_t ft_reg = inst.rt;
 
-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2FpuDiv(fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
     {
         uint8_t ftf = inst.vectorInfo.ftf;
         uint8_t ft_reg = inst.rt;
-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
+        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2FpuSqrt(ft); }}", ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
     {
+        uint8_t fsf = inst.vectorInfo.fsf;
         uint8_t ftf = inst.vectorInfo.ftf;
+        uint8_t fs_reg = inst.rd;
         uint8_t ft_reg = inst.rt;
-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
+        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2FpuRsqrt(fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)

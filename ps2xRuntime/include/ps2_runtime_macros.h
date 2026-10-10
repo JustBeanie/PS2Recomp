@@ -604,12 +604,71 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
 
 // FPU (COP1) operations
+// The EE FPU has no Inf, NaN or denormals (PCSX2 FPU.cpp fpuDouble/checkOverflow):
+// an operand with exponent 255 reads as +-FLT_MAX, a denormal as +-0, and results
+// overflow to +-FLT_MAX / underflow to +-0. Division by zero yields +-FLT_MAX.
+inline float ps2FpuClamp(float v)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const uint32_t exponent = bits & 0x7F800000u;
+    if (exponent == 0x7F800000u)
+        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+    else if (exponent == 0u)
+        bits &= 0x80000000u;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+inline uint32_t ps2FpuBits(float v)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    return bits;
+}
+inline float ps2FpuFromBits(uint32_t bits)
+{
+    float v;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+inline float ps2FpuDiv(float fs, float ft)
+{
+    const uint32_t s = ps2FpuBits(fs), t = ps2FpuBits(ft);
+    if ((t & 0x7F800000u) == 0u)
+        return ps2FpuFromBits(((s ^ t) & 0x80000000u) | 0x7F7FFFFFu);
+    return ps2FpuClamp(ps2FpuClamp(fs) / ps2FpuClamp(ft));
+}
+// SQRT.S takes its operand from ft; negative inputs use |x| (sets I on hardware).
+inline float ps2FpuSqrt(float ft)
+{
+    const uint32_t t = ps2FpuBits(ft);
+    if ((t & 0x7F800000u) == 0u)
+        return ps2FpuFromBits(t & 0x80000000u);
+    return sqrtf(fabsf(ps2FpuClamp(ft)));
+}
+// RSQRT.S is fd = fs / sqrt(ft) on the EE (not 1/sqrt).
+inline float ps2FpuRsqrt(float fs, float ft)
+{
+    const uint32_t s = ps2FpuBits(fs), t = ps2FpuBits(ft);
+    if ((t & 0x7F800000u) == 0u)
+        return ps2FpuFromBits(((s ^ t) & 0x80000000u) | 0x7F7FFFFFu);
+    return ps2FpuClamp(ps2FpuClamp(fs) / sqrtf(fabsf(ps2FpuClamp(ft))));
+}
+// CVT.W.S always truncates, saturating at |x| >= 2^31.
+inline int32_t ps2FpuCvtW(float fs)
+{
+    const uint32_t s = ps2FpuBits(fs);
+    if ((s & 0x7F800000u) <= 0x4E800000u)
+        return static_cast<int32_t>(ps2FpuClamp(fs));
+    return (s & 0x80000000u) ? static_cast<int32_t>(0x80000000u) : 0x7FFFFFFF;
+}
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
-#define FPU_SQRT_S(a) sqrtf((float)(a))
+#define FPU_ADD_S(a, b) ps2FpuClamp(ps2FpuClamp((float)(a)) + ps2FpuClamp((float)(b)))
+#define FPU_SUB_S(a, b) ps2FpuClamp(ps2FpuClamp((float)(a)) - ps2FpuClamp((float)(b)))
+#define FPU_MUL_S(a, b) ps2FpuClamp(ps2FpuClamp((float)(a)) * ps2FpuClamp((float)(b)))
+#define FPU_DIV_S(a, b) ps2FpuDiv((float)(a), (float)(b))
+#define FPU_SQRT_S(a) ps2FpuSqrt((float)(a))
+#define FPU_RSQRT_S(a, b) ps2FpuRsqrt((float)(a), (float)(b))
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
 #define FPU_NEG_S(a) (-(float)(a))
@@ -618,12 +677,12 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_CEIL_L_S(a) ((int64_t)ceilf((float)(a)))
 #define FPU_FLOOR_L_S(a) ((int64_t)floorf((float)(a)))
 #define FPU_ROUND_W_S(a) ((int32_t)nearbyintf((float)(a)))
-#define FPU_TRUNC_W_S(a) ((int32_t)(float)(a))
+#define FPU_TRUNC_W_S(a) ps2FpuCvtW((float)(a))
 #define FPU_CEIL_W_S(a) ((int32_t)ceilf((float)(a)))
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+#define FPU_CVT_W_S(a) ps2FpuCvtW((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))

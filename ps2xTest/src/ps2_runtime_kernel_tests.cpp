@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -549,6 +550,31 @@ void register_ps2_runtime_kernel_tests()
 {
     MiniTest::Case("PS2RuntimeKernel", [](TestCase &tc)
     {
+        tc.Run("EE FPU helpers follow PS2 rules: no Inf/NaN, truncating CVT.W", [](TestCase &t)
+        {
+            const float fmax = std::numeric_limits<float>::max();
+            t.Equals(FPU_DIV_S(1.0f, 0.0f), fmax, "x/0 gives +FLT_MAX");
+            t.Equals(FPU_DIV_S(-1.0f, 0.0f), -fmax, "-x/0 gives -FLT_MAX");
+            t.Equals(FPU_DIV_S(1.0f, -0.0f), -fmax, "sign is the xor of operand signs");
+            t.Equals(FPU_DIV_S(0.0f, 0.0f), fmax, "0/0 gives +FLT_MAX, not NaN");
+            t.Equals(FPU_MUL_S(1.0e38f, 1.0e38f), fmax, "overflow clamps to FLT_MAX");
+            t.Equals(FPU_ADD_S(fmax, fmax), fmax, "add overflow clamps to FLT_MAX");
+            t.Equals(FPU_SQRT_S(-4.0f), 2.0f, "sqrt of a negative uses |x|");
+            t.Equals(FPU_RSQRT_S(6.0f, 9.0f), 2.0f, "RSQRT is fs / sqrt(ft)");
+            t.Equals(FPU_CVT_W_S(2.9f), 2, "CVT.W.S truncates");
+            t.Equals(FPU_CVT_W_S(-2.9f), -2, "CVT.W.S truncates toward zero");
+            t.Equals(FPU_CVT_W_S(3.0e9f), 0x7FFFFFFF, "CVT.W.S saturates high");
+            t.Equals(FPU_CVT_W_S(-3.0e9f), static_cast<int32_t>(0x80000000u), "CVT.W.S saturates low");
+            uint32_t infBits = 0x7F800000u;
+            float inf = 0.0f;
+            std::memcpy(&inf, &infBits, sizeof(inf));
+            t.Equals(FPU_ADD_S(inf, 0.0f), fmax, "an Inf bit pattern reads as FLT_MAX");
+            uint32_t denBits = 0x00000001u;
+            float den = 0.0f;
+            std::memcpy(&den, &denBits, sizeof(den));
+            t.Equals(FPU_MUL_S(den, 1.0e30f), 0.0f, "denormal operands read as zero");
+        });
+
         tc.Run("unsigned loads and ABI word writes extend independently", [](TestCase &t)
         {
             constexpr uint64_t kUpper = 0x1122334455667788ull;
