@@ -2535,6 +2535,12 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        // The EE FPU and VUs round toward zero and have no denormals (PCSX2's default
+        // "Chop" rounding with DAZ/FTZ). MXCSR is per host thread, so this covers the
+        // recompiled EE code and the VU interpreters running on it.
+        // PS2X_EE_ROUND_NEAREST=1 keeps the host default for A/B comparisons.
+        if (!std::getenv("PS2X_EE_ROUND_NEAREST"))
+            _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
