@@ -1266,8 +1266,24 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     }
 }
 
+// PS2X_GS_PIXEL_TRACE=x,y logs every draw that reaches the depth test at that
+// framebuffer pixel (use with PS2X_GS_THREADS=1): state, z vs stored z, source
+// colour and the destination before the write.
+static bool pixelTraceWanted(int x, int y)
+{
+    static const std::pair<int, int> target = []()
+    {
+        std::pair<int, int> p{-1, -1};
+        if (const char *env = std::getenv("PS2X_GS_PIXEL_TRACE"))
+            std::sscanf(env, "%d,%d", &p.first, &p.second);
+        return p;
+    }();
+    return x == target.first && y == target.second;
+}
+
 void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
 {
+    const bool tracePixel = pixelTraceWanted(x, y);
     const auto &ctx = state.context;
     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
         return;
@@ -1356,6 +1372,12 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         break;
     }
 
+    if (tracePixel)
+        std::fprintf(stderr, "[pix] prim=%u tme=%u fbp=%u fpsm=0x%x zbp=%u zpsm=0x%x test=0x%llx alpha=0x%llx tex=0x%x/0x%x z=%u stored=%u zpass=%d rgba=%u,%u,%u,%u dst=0x%08x wm=%d%d%d\n",
+                     static_cast<unsigned>(state.prim.type), state.prim.tme ? 1u : 0u, ctx.frame.fbp, fpsm, ctx.zbuf.zbp, zpsm,
+                     static_cast<unsigned long long>(ctx.test), static_cast<unsigned long long>(ctx.alpha),
+                     ctx.tex0.tbp0, static_cast<unsigned>(ctx.tex0.psm), static_cast<unsigned>(z), storedZ, zpass ? 1 : 0,
+                     r, g, b, a, fbrgba, writeMask.writeRgb ? 1 : 0, writeMask.writeAlpha ? 1 : 0, writeMask.writeDepth ? 1 : 0);
     if (!zpass)
     {
         return;
@@ -1760,15 +1782,21 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
                 continue;
 
-            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            // Interpolate as v2 + (v0-v2)*w0 + (v1-v2)*w1: exact for an attribute that is
+            // constant over the triangle. The weighted sum drifted (alpha 128 -> 127.99 ->
+            // 127), which flipped the destination-alpha MSB that Sly 2's DATE decal
+            // passes test and left dark speckles across the sky.
+            const auto lerp3 = [w0, w1](double a0, double a1, double a2)
+            { return a2 + (a0 - a2) * w0 + (a1 - a2) * w1; };
+            double z = lerp3(v0.z, v1.z, v2.z);
 
             uint8_t r, g, b, a;
             if (state.prim.iip)
             {
-                r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
-                g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
-                b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
-                a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+                r = clampU8(static_cast<int>(lerp3(v0.r, v1.r, v2.r)));
+                g = clampU8(static_cast<int>(lerp3(v0.g, v1.g, v2.g)));
+                b = clampU8(static_cast<int>(lerp3(v0.b, v1.b, v2.b)));
+                a = clampU8(static_cast<int>(lerp3(v0.a, v1.a, v2.a)));
             }
             else
             {
@@ -1784,8 +1812,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 uint16_t iu, iv;
                 if (state.prim.fst)
                 {
-                    iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
-                    iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
+                    iu = static_cast<uint16_t>(lerp3(v0.u, v1.u, v2.u));
+                    iv = static_cast<uint16_t>(lerp3(v0.v, v1.v, v2.v));
                     is = 0.0f;
                     it = 0.0f;
                     iq = 1.0f;
@@ -1795,9 +1823,9 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                     // The GS DDA interpolates the homogeneous S, T and Q
                     // values. Texel coordinates are calculated from S/Q and
                     // T/Q only after interpolation.
-                    is = v0.s * w0 + v1.s * w1 + v2.s * w2;
-                    it = v0.t * w0 + v1.t * w1 + v2.t * w2;
-                    iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
+                    is = static_cast<float>(lerp3(v0.s, v1.s, v2.s));
+                    it = static_cast<float>(lerp3(v0.t, v1.t, v2.t));
+                    iq = static_cast<float>(lerp3(v0.q, v1.q, v2.q));
                     iu = 0;
                     iv = 0;
                 }
@@ -1822,7 +1850,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 a = color.a;
             }
 
-            const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
+            const uint8_t fog = clampU8(static_cast<int>(lerp3(v0.fog, v1.fog, v2.fog)));
             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
         }
     }

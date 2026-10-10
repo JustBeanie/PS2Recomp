@@ -880,6 +880,53 @@ void register_ps2_gs_tests()
             t.IsTrue(serial == banded, "4 raster workers should produce byte-identical VRAM to the serial rasterizer");
         });
 
+        tc.Run("Gouraud triangles keep a constant vertex colour exact at every pixel", [](TestCase &t)
+        {
+            // Sly 2's decal passes write vertex alpha 0x80 and then test its MSB with
+            // DATE; a weighted-sum interpolation produced 127.99 -> 0x7F on scattered
+            // pixels and the decal leaked through as dark speckles.
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, (4ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, (0x80ull) | (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (255ull << 16) | (255ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE) | (1ull << 3)); // IIP, no blend
+            constexpr uint32_t kColor = 0x80302010u;
+            uint32_t seed = 0x9E3779B9u;
+            auto next = [&seed]()
+            {
+                seed = seed * 1664525u + 1013904223u;
+                return seed >> 8;
+            };
+            for (int tri = 0; tri < 300; ++tri)
+            {
+                for (int v = 0; v < 3; ++v)
+                {
+                    gs.writeRegister(GS_REG_RGBAQ, kColor);
+                    const uint64_t x = static_cast<uint64_t>(next() % (256u * 16u));
+                    const uint64_t y = static_cast<uint64_t>(next() % (256u * 16u));
+                    gs.writeRegister(GS_REG_XYZ2, x | (y << 16));
+                }
+            }
+            gs.refreshDisplaySnapshot();
+            uint32_t drawn = 0u, wrong = 0u;
+            for (size_t i = 0; i + 4u <= 256u * 256u * 4u; i += 4u)
+            {
+                uint32_t px = 0u;
+                std::memcpy(&px, vram.data() + i, sizeof(px));
+                if (px == 0u)
+                    continue;
+                ++drawn;
+                if (px != kColor)
+                    ++wrong;
+            }
+            t.IsTrue(drawn > 1000u, "triangles should cover pixels");
+            t.Equals(wrong, 0u, "every covered pixel keeps the exact constant colour (alpha 0x80)");
+        });
+
         tc.Run("GS fog blends the shaded color toward FOGCOL before framebuffer blending", [](TestCase &t)
         {
             auto renderFoggedPoint = [](bool fogEnabled, uint8_t fog, uint32_t fogColor = 0u) -> uint32_t
