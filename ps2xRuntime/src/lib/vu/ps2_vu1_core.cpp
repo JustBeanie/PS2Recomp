@@ -22,6 +22,12 @@ namespace
     {
         return static_cast<uint8_t>(1u << (3u - component));
     }
+
+    // Inverse of laneForComponent for a lane bit index (x = bit 3 ... w = bit 0).
+    constexpr uint32_t componentForLaneBit(uint32_t bit)
+    {
+        return 3u - bit;
+    }
 }
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
@@ -1049,30 +1055,13 @@ void VU1Interpreter::flushPipelines()
 uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
 {
     uint64_t ready = m_cycle;
-    const InstructionUsage *usages[2] = {
-        &decoded.upperUsage,
-        &decoded.lowerUsage};
-    for (const InstructionUsage *usage : usages)
-    {
-        if (!usage)
-            continue;
-        for (uint32_t index = 0; index < usage->vfReadCount; ++index)
-        {
-            const VfAccess &access = usage->vfRead[index];
-            for (uint32_t component = 0; component < 4u; ++component)
-            {
-                if ((access.lanes & laneForComponent(component)) != 0u)
-                    ready = std::max(ready, m_vfReady[access.reg][component]);
-            }
-        }
-        for (uint32_t viRead = usage->viRead & 0xFFFEu; viRead != 0u; viRead &= viRead - 1u)
-            ready = std::max(ready, m_viReady[static_cast<uint32_t>(std::countr_zero(viRead))]);
-        for (uint32_t component = 0; component < 4u; ++component)
-        {
-            if ((usage->accRead & laneForComponent(component)) != 0u)
-                ready = std::max(ready, m_accReady[component]);
-        }
-    }
+    const uint64_t *vfReady = &m_vfReady[0][0];
+    for (uint32_t i = 0; i < decoded.vfReadLaneCount; ++i)
+        ready = std::max(ready, vfReady[decoded.vfReadLanes[i]]);
+    for (uint32_t viRead = decoded.viReadMask; viRead != 0u; viRead &= viRead - 1u)
+        ready = std::max(ready, m_viReady[static_cast<uint32_t>(std::countr_zero(viRead))]);
+    for (uint32_t accRead = decoded.accReadMask; accRead != 0u; accRead &= accRead - 1u)
+        ready = std::max(ready, m_accReady[componentForLaneBit(static_cast<uint32_t>(std::countr_zero(accRead)))]);
 
     if (decoded.lowerUsage.pipeline == PipelineFdiv && m_fdiv.valid)
         ready = std::max(ready, m_fdiv.readyCycle);
@@ -1575,6 +1564,22 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
     if (!decoded.iBit)
         decoded.lowerUsage = decodeLowerUsage(decoded.lower);
 
+    for (const InstructionUsage *usage : {&decoded.upperUsage, &decoded.lowerUsage})
+    {
+        for (uint32_t index = 0; index < usage->vfReadCount; ++index)
+        {
+            const VfAccess &access = usage->vfRead[index];
+            for (uint32_t component = 0; component < 4u; ++component)
+            {
+                if ((access.lanes & laneForComponent(component)) != 0u &&
+                    decoded.vfReadLaneCount < decoded.vfReadLanes.size())
+                    decoded.vfReadLanes[decoded.vfReadLaneCount++] = static_cast<uint8_t>(access.reg * 4u + component);
+            }
+        }
+        decoded.viReadMask |= static_cast<uint16_t>(usage->viRead & 0xFFFEu);
+        decoded.accReadMask |= usage->accRead;
+    }
+
     const uint8_t upperWriteReg = decoded.upperUsage.vfWrite.reg;
     if (upperWriteReg != 0u && (vfReadLanes(decoded.lowerUsage, upperWriteReg) != 0u || decoded.lowerUsage.vfWrite.reg == upperWriteReg))
     {
@@ -1744,14 +1749,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
         uint8_t writtenVi = 0u;
         int32_t oldVi = 0;
-        for (uint32_t reg = 1; reg < 16u; ++reg)
+        if (const uint32_t viWrites = decoded.lowerUsage.viWrite & 0xFFFEu; viWrites != 0u)
         {
-            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
-            {
-                writtenVi = static_cast<uint8_t>(reg);
-                oldVi = m_state.vi[reg];
-                break;
-            }
+            writtenVi = static_cast<uint8_t>(std::countr_zero(viWrites));
+            oldVi = m_state.vi[writtenVi];
         }
 
         const VfAccess upperWrite = decoded.upperUsage.vfWrite;

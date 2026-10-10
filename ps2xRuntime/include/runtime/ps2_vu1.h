@@ -126,6 +126,12 @@ private:
         bool tBit = false;
         uint8_t upperVfShadowReg = 0;
         uint8_t suppressedLowerVf = 0;
+        // Flattened reg*4+lane indices of every VF lane either half reads, and
+        // the union of VI and ACC reads: calculatePairReadyCycle's inputs.
+        std::array<uint8_t, 16> vfReadLanes{};
+        uint8_t vfReadLaneCount = 0;
+        uint16_t viReadMask = 0;
+        uint8_t accReadMask = 0;
     };
 
     struct FlagPipelineEntry
