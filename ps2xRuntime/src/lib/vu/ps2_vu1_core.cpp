@@ -1576,10 +1576,10 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
 void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
                                              const PS2Memory *memory, uint64_t generation)
 {
-    const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
-    for (uint32_t i = 0; i < pairCount; ++i)
-        m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
-
+    // Invalidate lazily: a stamp that no longer matches the generation re-decodes
+    // that pair on its next use.
+    if (m_cachedVuCode != vuCode || m_cachedMemory != memory || m_cachedCodeSize != codeSize)
+        m_decodedPairStamp.fill(0u);
     m_cachedVuCode = vuCode;
     m_cachedMemory = memory;
     m_cachedCodeSize = codeSize;
@@ -1587,17 +1587,24 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
     m_decodedCodeCacheValid = true;
 }
 
-VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPairForPc(
+const VU1Interpreter::DecodedInstructionPair &VU1Interpreter::getDecodedInstructionPairForPc(
     const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc)
 {
     if ((pc & 7u) != 0u)
-        return decodeInstructionPair(vuCode, pc);
+    {
+        m_uncachedPair = decodeInstructionPair(vuCode, pc);
+        return m_uncachedPair;
+    }
 
     const bool trackedVu1Code = memory != nullptr &&
                                 ((m_unit == Unit::VU1 && vuCode == memory->getVU1Code()) ||
                                  (m_unit == Unit::VU0 && vuCode == memory->getVU0Code()));
-    if (!trackedVu1Code)
-        return decodeInstructionPair(vuCode, pc);
+    const uint32_t pairIndex = pc / 8u;
+    if (!trackedVu1Code || pairIndex >= kMaxDecodedPairs || pairIndex >= codeSize / 8u)
+    {
+        m_uncachedPair = decodeInstructionPair(vuCode, pc);
+        return m_uncachedPair;
+    }
 
     const uint64_t generation = m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
     if (!m_decodedCodeCacheValid ||
@@ -1608,9 +1615,11 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
     {
         rebuildDecodedCodeCache(vuCode, codeSize, memory, generation);
     }
-    const uint32_t pairIndex = pc / 8u;
-    if (pairIndex >= kMaxDecodedPairs)
-        return decodeInstructionPair(vuCode, pc);
+    if (m_decodedPairStamp[pairIndex] != generation + 1u)
+    {
+        m_decodedCodeCache[pairIndex] = decodeInstructionPair(vuCode, pc);
+        m_decodedPairStamp[pairIndex] = generation + 1u;
+    }
     return m_decodedCodeCache[pairIndex];
 }
 
@@ -1681,7 +1690,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (m_state.pc + 8u > codeSize)
             break;
 
-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+        const DecodedInstructionPair &decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {
             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
