@@ -7,6 +7,7 @@
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <thread>
@@ -18,6 +19,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 using namespace GSInternal;
 
@@ -1057,12 +1059,76 @@ void GSCpuBackend::DumpTextureOnce(const GSDrawState &state)
     }
 }
 
+// PS2X_GS_PHASE_LOG=start_s:duration_s prints one [gs:phase] line to stderr
+// each time the draw state changes (prim type, context, FRAME, ZBUF, TEST,
+// ALPHA, TEX0), with the run length of the previous state. Lines line up with
+// PCSX2's per-draw dump (tools/pcsx2_ctx_summary.py) for differential checks.
+static void logDrawPhase(const GSPrimitiveBatch &batch)
+{
+    struct Window
+    {
+        double start = -1.0, end = -1.0;
+    };
+    static const Window window = []()
+    {
+        Window w;
+        if (const char *env = std::getenv("PS2X_GS_PHASE_LOG"))
+        {
+            char *end = nullptr;
+            w.start = std::strtod(env, &end);
+            w.end = w.start + ((end && *end == ':') ? std::strtod(end + 1, nullptr) : 1.0);
+        }
+        return w;
+    }();
+    if (window.start < 0.0)
+        return;
+    static const auto t0 = std::chrono::steady_clock::now();
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (now < window.start || now >= window.end)
+        return;
+
+    const GSDrawState &state = batch.state;
+    const auto &ctx = state.context;
+    char key[384];
+    int len = std::snprintf(key, sizeof(key),
+                            "prim=%u tme=%u abe=%u ctxt=%u fbp=0x%x fbw=%u fpsm=0x%x fbmsk=0x%x zbp=0x%x zpsm=0x%x zmsk=%u "
+                            "test=0x%llx alpha=0x%llx",
+                            static_cast<unsigned>(state.prim.type), static_cast<unsigned>(state.prim.tme),
+                            static_cast<unsigned>(state.prim.abe), static_cast<unsigned>(state.prim.ctxt),
+                            ctx.frame.fbp * 32u, ctx.frame.fbw, static_cast<unsigned>(ctx.frame.psm), ctx.frame.fbmsk,
+                            ctx.zbuf.zbp * 32u, static_cast<unsigned>(ctx.zbuf.psm), ctx.zbuf.zmask ? 1u : 0u,
+                            static_cast<unsigned long long>(ctx.test), static_cast<unsigned long long>(ctx.alpha));
+    if (state.prim.tme && len > 0 && len < static_cast<int>(sizeof(key)))
+        std::snprintf(key + len, sizeof(key) - len, " tex=0x%x/%u/0x%x %ux%u tfx=%u cbp=0x%x",
+                      ctx.tex0.tbp0, static_cast<unsigned>(ctx.tex0.tbw), static_cast<unsigned>(ctx.tex0.psm),
+                      static_cast<unsigned>(ctx.tex0.tw), static_cast<unsigned>(ctx.tex0.th),
+                      static_cast<unsigned>(ctx.tex0.tfx), ctx.tex0.cbp);
+
+    static std::string s_lastKey;
+    static uint32_t s_runLength = 0u;
+    if (s_lastKey == key)
+    {
+        ++s_runLength;
+        return;
+    }
+    const GSVertex &v0 = batch.vertices[0];
+    const GSVertex &v1 = batch.vertices[1];
+    std::fprintf(stderr, "[gs:phase] t=%.3f prev_n=%u %s v0=(%.1f,%.1f,z%.0f) v1=(%.1f,%.1f,z%.0f) rgba0=%u,%u,%u,%u\n",
+                 now, s_runLength, key, v0.x, v0.y, v0.z, v1.x, v1.y, v1.z,
+                 static_cast<unsigned>(v0.r), static_cast<unsigned>(v0.g), static_cast<unsigned>(v0.b),
+                 static_cast<unsigned>(v0.a));
+    s_lastKey = key;
+    s_runLength = 1u;
+}
+
 void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
     if (state.prim.tme)
         DumpTextureOnce(state);
+    if (t_bandIndex == 0u)
+        logDrawPhase(batch);
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
         if (primitiveLogWanted(primitiveIndex))

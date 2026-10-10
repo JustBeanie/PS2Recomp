@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -1107,6 +1108,22 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         regAddr == GS_REG_TRXPOS ||
         regAddr == GS_REG_TRXREG ||
         regAddr == GS_REG_TRXDIR;
+
+    // PS2X_GS_REG_TRACE=1 prints FRAME/ZBUF writes whose value changed (first 4000)
+    {
+        static const bool regTrace = std::getenv("PS2X_GS_REG_TRACE") != nullptr;
+        static uint64_t s_lastValue[0x100] = {};
+        static uint32_t s_printed = 0u;
+        if (regTrace && (regAddr == GS_REG_FRAME_1 || regAddr == GS_REG_FRAME_2 ||
+                         regAddr == GS_REG_ZBUF_1 || regAddr == GS_REG_ZBUF_2) &&
+            s_lastValue[regAddr] != value && s_printed < 4000u)
+        {
+            ++s_printed;
+            s_lastValue[regAddr] = value;
+            std::fprintf(stderr, "[gs:regtrace] reg=0x%02x value=0x%016llx\n", static_cast<unsigned>(regAddr),
+                         static_cast<unsigned long long>(value));
+        }
+    }
 
     PS2_IF_AGRESSIVE_LOGS({
         if (interestingReg)
