@@ -253,6 +253,9 @@ struct GSDrawState
     // TEXFLUSH count when queued: a raster worker drops its decoded texture pages
     // before the first draw with a newer epoch.
     uint64_t textureEpoch = 0;
+    // All raster workers finish the earlier draws of the batch before any starts
+    // this one (set when it samples/overwrites pages an earlier queued draw uses).
+    bool barrierBefore = false;
 };
 
 struct GSPrimitiveBatch

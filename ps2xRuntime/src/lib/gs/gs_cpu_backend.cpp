@@ -627,6 +627,7 @@ void GSCpuBackend::StartWorkers(uint32_t count)
     if (count <= 1u)
         return; // serial: draws run on the submitting thread
     m_workers.reserve(count);
+    m_drawBarrier = std::make_unique<std::barrier<>>(static_cast<std::ptrdiff_t>(count));
     for (uint32_t i = 0; i < count; ++i)
         m_workers.push_back(std::make_unique<RasterWorker>());
     for (uint32_t i = 0; i < count; ++i)
@@ -675,6 +676,8 @@ void GSCpuBackend::WorkerMain(uint32_t index)
                 self.textureCache.Invalidate();
                 self.textureCacheEpoch = batch.state.textureEpoch;
             }
+            if (batch.state.barrierBefore)
+                m_drawBarrier->arrive_and_wait();
             DrawPrimitive(batch);
         }
 
@@ -705,6 +708,9 @@ void GSCpuBackend::KickPendingDraws()
         std::lock_guard<std::mutex> lock(m_workMutex);
         m_activeDraws.swap(m_pendingDraws);
         m_workersDone = 0u;
+        // The next batch starts only after this one finishes.
+        m_segmentWritePages.fill(0u);
+        m_segmentReadPages.fill(0u);
         m_batchInFlight = true;
         ++m_workGeneration;
     }
@@ -782,22 +788,38 @@ namespace
     }
 }
 
-bool GSCpuBackend::DrawConflictsWithPending(const GSDrawState &state) const
+void GSCpuBackend::PageSetsFor(const GSDrawState &state, PageSet &written, PageSet &sampled)
 {
-    bool conflict = false;
-    forEachSampledPage(state, [&](uint32_t page)
-                       { conflict = conflict || pageSetHas(m_pendingWritePages, page); });
-    forEachWrittenPage(state, [&](uint32_t page)
-                       { conflict = conflict || pageSetHas(m_pendingReadPages, page); });
-    return conflict;
-}
+    const auto &ctx = state.context;
+    const std::array<uint64_t, 3> writtenKey = {
+        (static_cast<uint64_t>(ctx.frame.fbp) << 32) | (static_cast<uint64_t>(ctx.frame.fbw) << 8) | ctx.frame.psm,
+        (static_cast<uint64_t>(ctx.zbuf.zbp) << 32) | (static_cast<uint64_t>(ctx.zbuf.psm) << 8) | (ctx.zbuf.zmask ? 1u : 0u),
+        (static_cast<uint64_t>(ctx.scissor.y0) << 16) | ctx.scissor.y1};
+    if (writtenKey != m_cachedWrittenKey)
+    {
+        m_cachedWrittenPages.fill(0u);
+        forEachWrittenPage(state, [&](uint32_t page)
+                           { pageSetAdd(m_cachedWrittenPages, page); });
+        m_cachedWrittenKey = writtenKey;
+    }
+    written = m_cachedWrittenPages;
 
-void GSCpuBackend::MarkPendingAccess(const GSDrawState &state)
-{
-    forEachWrittenPage(state, [&](uint32_t page)
-                       { pageSetAdd(m_pendingWritePages, page); });
-    forEachSampledPage(state, [&](uint32_t page)
-                       { pageSetAdd(m_pendingReadPages, page); });
+    if (!state.prim.tme)
+    {
+        sampled.fill(0u);
+        return;
+    }
+    const std::array<uint64_t, 2> sampledKey = {
+        (static_cast<uint64_t>(ctx.tex0.tbp0) << 32) | (static_cast<uint64_t>(ctx.tex0.tbw) << 8) | ctx.tex0.psm,
+        state.textureHeight};
+    if (sampledKey != m_cachedSampledKey)
+    {
+        m_cachedSampledPages.fill(0u);
+        forEachSampledPage(state, [&](uint32_t page)
+                           { pageSetAdd(m_cachedSampledPages, page); });
+        m_cachedSampledKey = sampledKey;
+    }
+    sampled = m_cachedSampledPages;
 }
 
 void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
@@ -846,16 +868,37 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     const bool indexed = batch.state.prim.tme &&
                          (isFourBitIndexedPsm(batch.state.context.tex0.psm) ||
                           isEightBitIndexedPsm(batch.state.context.tex0.psm));
-    // Workers run each draw band by band, so a draw that samples pages queued draws
-    // still write (render-to-texture), or writes pages queued draws still sample,
-    // would see other bands half done. Wait for the queue first.
-    if (DrawConflictsWithPending(batch.state))
-        DrainDraws();
-    MarkPendingAccess(batch.state);
+    // Workers run each draw band by band, so a draw that samples pages earlier draws
+    // in the batch write (render-to-texture), or writes pages they sample, would see
+    // other bands half done. Such a draw gets a worker barrier: every band finishes
+    // the earlier draws first. The submitting thread never waits for it, so chains
+    // of dependent post passes (Sly 2's 32 channel-shuffle strips) stay parallel.
+    // Draws in the in-flight batch need nothing: a batch starts after the previous.
+    PageSet written{}, sampled{};
+    PageSetsFor(batch.state, written, sampled);
+    uint64_t conflict = 0u;
+    for (size_t i = 0; i < written.size(); ++i)
+        conflict |= (sampled[i] & m_segmentWritePages[i]) | (written[i] & m_segmentReadPages[i]);
+    bool barrier = false;
+    if (conflict != 0u && !m_pendingDraws.empty())
+    {
+        barrier = true;
+        m_segmentWritePages.fill(0u);
+        m_segmentReadPages.fill(0u);
+    }
+    for (size_t i = 0; i < written.size(); ++i)
+    {
+        m_segmentWritePages[i] |= written[i];
+        m_segmentReadPages[i] |= sampled[i];
+        // EE-side readers (LoadClut) check everything queued or in flight.
+        m_pendingWritePages[i] |= written[i];
+        m_pendingReadPages[i] |= sampled[i];
+    }
 
     constexpr size_t kDrawBatchSize = 128u;
     m_pendingDraws.push_back(batch);
     m_pendingDraws.back().state.textureEpoch = m_textureCacheEpoch;
+    m_pendingDraws.back().state.barrierBefore = barrier;
     if (indexed)
         m_pendingDraws.back().state.clut = CurrentClutSnapshot();
     if (m_pendingDraws.size() >= kDrawBatchSize)
@@ -968,7 +1011,7 @@ void GSCpuBackend::TextureFlush()
     // TEXFLUSH: later draws must not sample stale decoded texture pages. Each queued
     // draw carries the epoch it was issued in and a worker drops its page cache
     // before the first draw of a newer epoch. A draw that samples pages a queued
-    // draw still writes already drains in Submit (DrawConflictsWithPending), so
+    // draw still writes already drains in Submit (its page-hazard check), so
     // nothing here has to block the EE; Sly 2 issues TEXFLUSH for nearly every draw.
     m_texturePageCache.Invalidate();
     ++m_textureCacheEpoch;

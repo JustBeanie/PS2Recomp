@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <barrier>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -56,8 +57,9 @@ private:
     void WaitForDraws();
     void DrainDraws();
     const uint16_t *CurrentClutSnapshot();
-    bool DrawConflictsWithPending(const GSDrawState &state) const;
-    void MarkPendingAccess(const GSDrawState &state);
+    // Pages a draw writes (frame, Z) and samples (texture), cached by the registers
+    // that determine them: consecutive draws almost always share both.
+    void PageSetsFor(const GSDrawState &state, std::array<uint64_t, 8> &written, std::array<uint64_t, 8> &sampled);
 
     void ResetUnlocked();
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
@@ -124,4 +126,13 @@ private:
     // 8 KB VRAM pages written / sampled by queued or in-flight draws (512 pages = 4 MB).
     std::array<uint64_t, 8> m_pendingWritePages{};
     std::array<uint64_t, 8> m_pendingReadPages{};
+    // Pages written / sampled by the pending batch since its last worker barrier;
+    // a draw that conflicts with them gets barrierBefore instead of a drain.
+    std::array<uint64_t, 8> m_segmentWritePages{};
+    std::array<uint64_t, 8> m_segmentReadPages{};
+    std::unique_ptr<std::barrier<>> m_drawBarrier;
+    std::array<uint64_t, 8> m_cachedWrittenPages{};
+    std::array<uint64_t, 8> m_cachedSampledPages{};
+    std::array<uint64_t, 3> m_cachedWrittenKey{~0ull, ~0ull, ~0ull};
+    std::array<uint64_t, 2> m_cachedSampledKey{~0ull, ~0ull};
 };
