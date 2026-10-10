@@ -2563,7 +2563,12 @@ namespace ps2_stubs
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(param_1);
             MpegPlaybackState resetState = makeFreshPlaybackStatePreservingConfig(playback);
-            if (playback.streamEnded || playback.decoderFailed)
+            // Keep an ended handle ended only for sceCdSt streaming, where the next
+            // sceCdStStart reopens it. Games that read the PSS themselves (Sly 2:
+            // sceCdRead into its own ring) reset the handle to play the next movie;
+            // carrying "ended" over made that movie end before its first frame.
+            const bool cdStreamEnded = g_mpeg_stub_state.currentCdStreamEofSeen;
+            if (cdStreamEnded && (playback.streamEnded || playback.decoderFailed))
             {
                 resetState.sawInput = true;
                 resetState.streamEnded = true;
