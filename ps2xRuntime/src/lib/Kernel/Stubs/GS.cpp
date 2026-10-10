@@ -71,40 +71,17 @@ namespace ps2_stubs
             uint32_t arg2 = 0u;
         };
 
+        // EE EABI: arguments 5-8 travel in $t0-$t3 (GPR 8-11), never on the stack.
         GsTrailingArgs2 decodeGsTrailingArgs2(uint8_t *rdram, R5900Context *ctx)
         {
-            const uint32_t reg8 = getRegU32(ctx, 8);
-            const uint32_t reg9 = getRegU32(ctx, 9);
-            const uint32_t stack0 = readStackU32(rdram, ctx, 16);
-            const uint32_t stack1 = readStackU32(rdram, ctx, 20);
-
-            const bool hasRegArgs = (reg8 != 0u || reg9 != 0u);
-            const bool hasStackArgs = (stack0 != 0u || stack1 != 0u);
-            if (hasRegArgs || !hasStackArgs)
-            {
-                return {reg8, reg9};
-            }
-
-            return {stack0, stack1};
+            (void)rdram;
+            return {getRegU32(ctx, 8), getRegU32(ctx, 9)};
         }
 
         GsTrailingArgs3 decodeGsTrailingArgs3(uint8_t *rdram, R5900Context *ctx)
         {
-            const uint32_t reg8 = getRegU32(ctx, 8);
-            const uint32_t reg9 = getRegU32(ctx, 9);
-            const uint32_t reg10 = getRegU32(ctx, 10);
-            const uint32_t stack0 = readStackU32(rdram, ctx, 16);
-            const uint32_t stack1 = readStackU32(rdram, ctx, 20);
-            const uint32_t stack2 = readStackU32(rdram, ctx, 24);
-
-            const bool hasRegArgs = (reg8 != 0u || reg9 != 0u || reg10 != 0u);
-            const bool hasStackArgs = (stack0 != 0u || stack1 != 0u || stack2 != 0u);
-            if (hasRegArgs || !hasStackArgs)
-            {
-                return {reg8, reg9, reg10};
-            }
-
-            return {stack0, stack1, stack2};
+            (void)rdram;
+            return {getRegU32(ctx, 8), getRegU32(ctx, 9), getRegU32(ctx, 10)};
         }
 
         void applyGsClearPacket(PS2Runtime *runtime, const GsClearMem &clear)
@@ -943,9 +920,10 @@ namespace ps2_stubs
         uint32_t psm = getRegU32(ctx, 5);
         uint32_t w = getRegU32(ctx, 6);
         uint32_t h = getRegU32(ctx, 7);
-        const uint32_t ztest = readStackU32(rdram, ctx, 16);
-        const uint32_t zpsm = readStackU32(rdram, ctx, 20);
-        const uint32_t clear = readStackU32(rdram, ctx, 24);
+        const GsTrailingArgs3 trailing = decodeGsTrailingArgs3(rdram, ctx);
+        const uint32_t ztest = trailing.arg0;
+        const uint32_t zpsm = trailing.arg1;
+        const uint32_t clear = trailing.arg2;
         (void)clear;
 
         if (w == 0u)

@@ -584,6 +584,43 @@ void register_ps2_gs_tests()
                      "sceGsSwapDBuffDc should preserve the display width from the seeded env");
         });
 
+        tc.Run("sceGsSetDefDBuff reads ztest/zpsm from $t0/$t1, not the stack", [](TestCase &t)
+        {
+            // Sly 2: sceGsSetDefDBuff(db, 0, 512, 224, ztest=3, zpsm=0x30, clear=0). Reading
+            // ztest from the stack picked up 0 and set ZMSK, so the game never wrote Z.
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t kEnvAddr = 0x5000u;
+            constexpr uint32_t kStackAddr = 0x900u;
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kEnvAddr);
+            setRegU32(ctx, 5, 0u);
+            setRegU32(ctx, 6, 512u);
+            setRegU32(ctx, 7, 224u);
+            setRegU32(ctx, 8, 3u);
+            setRegU32(ctx, 9, 0x30u);
+            setRegU32(ctx, 10, 0u);
+            setRegU32(ctx, 29, kStackAddr);
+            ps2_stubs::sceGsSetDefDBuff(rdram.data(), &ctx, &runtime);
+
+            uint32_t zbufCount = 0u;
+            for (uint32_t off = 0; off + 16u <= 0x400u; off += 16u)
+            {
+                uint64_t value = 0u;
+                uint64_t reg = 0u;
+                std::memcpy(&value, rdram.data() + kEnvAddr + off, sizeof(value));
+                std::memcpy(&reg, rdram.data() + kEnvAddr + off + 8u, sizeof(reg));
+                if (reg == 0x4Eu || reg == 0x4Fu)
+                {
+                    ++zbufCount;
+                    t.IsTrue(((value >> 32) & 1u) == 0u, "ztest=GREATER must leave ZMSK clear");
+                    t.IsTrue(((value >> 24) & 0xFu) == 0u, "zpsm 0x30 must encode Z32");
+                }
+            }
+            t.IsTrue(zbufCount >= 2u, "both draw environments should carry a ZBUF register");
+        });
+
         tc.Run("sceGsSetDefDBuffDc seeds a clear packet and swap clears the draw buffer", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -611,9 +648,11 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 6, 640u);
             setRegU32(ctx, 7, 448u);
             setRegU32(ctx, 29, kStackAddr);
+            // EE EABI: ztest/zpsm/clear are args 5-7, passed in $t0-$t2.
+            setRegU32(ctx, 8, kZTest);
+            setRegU32(ctx, 9, 0u);
+            setRegU32(ctx, 10, kEnableClear);
             std::memset(rdram.data() + kEnvAddr, 0xCD, kDBuffSize);
-            std::memcpy(rdram.data() + kStackAddr + 16u, &kZTest, sizeof(kZTest));
-            std::memcpy(rdram.data() + kStackAddr + 24u, &kEnableClear, sizeof(kEnableClear));
             std::memset(runtime.memory().getGSVRAM(), 0xAB, 16u);
             ps2_stubs::sceGsSetDefDBuffDc(rdram.data(), &ctx, &runtime);
 
