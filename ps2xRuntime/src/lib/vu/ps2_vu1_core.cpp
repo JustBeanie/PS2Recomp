@@ -110,28 +110,6 @@ void VU1Interpreter::reset()
     resetScheduler();
 }
 
-float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
-{
-    return normalizeOperand(vf[bc & 3u]);
-}
-
-float VU1Interpreter::normalizeOperand(float value) const
-{
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const uint32_t exponent = (bits >> 23) & 0xFFu;
-    if (exponent == 0u)
-    {
-        bits &= 0x80000000u;
-    }
-    else if (exponent == 0xFFu)
-    {
-        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
-    }
-    std::memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
 float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
 {
     uint32_t bits = 0;
@@ -211,6 +189,17 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
         laneFlags[component] = 0u;
         if ((dest & laneForComponent(component)) == 0u)
             continue;
+
+        // Fast path: a normal host result below FLT_MAX means the exact result was
+        // in range too (the game thread rounds toward zero, so an exact overflow
+        // lands on FLT_MAX itself, and an exact underflow is not normal). The
+        // exact path would keep this value and report only the sign.
+        const uint32_t magnitude = std::bit_cast<uint32_t>(result[component]) & 0x7FFFFFFFu;
+        if (magnitude >= 0x00800000u && magnitude < 0x7F7FFFFFu)
+        {
+            laneFlags[component] = std::signbit(result[component]) ? 0x2u : 0u;
+            continue;
+        }
 
         long double exactResult = 0.0L;
         if (calculateFmacExactResult(component, exactResult))
@@ -486,6 +475,17 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
             right = normalizeOperand(m_state.vf[ft][component]);
         }
 
+        // Normal operands whose biased exponents sum to 128..379 give a product
+        // strictly inside [FLT_MIN, FLT_MAX): only the sign can be reported.
+        const uint32_t leftExp = (std::bit_cast<uint32_t>(left) >> 23) & 0xFFu;
+        const uint32_t rightExp = (std::bit_cast<uint32_t>(right) >> 23) & 0xFFu;
+        const uint32_t expSum = leftExp + rightExp;
+        if (leftExp != 0u && rightExp != 0u && expSum >= 128u && expSum <= 379u)
+        {
+            if (std::signbit(left) != std::signbit(right))
+                extraSticky |= 0x2u;
+            continue;
+        }
         float product = left * right;
         const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
         const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);

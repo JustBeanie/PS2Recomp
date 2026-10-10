@@ -314,13 +314,23 @@ private:
     void markPairWrites(const DecodedInstructionPair &decoded);
     bool pipelinesPending() const;
 
-    float normalizeOperand(float value) const;
+    // Inline: called per lane from ps2_vu1_upper.cpp, a separate translation unit.
+    float normalizeOperand(float value) const
+    {
+        uint32_t bits = std::bit_cast<uint32_t>(value);
+        const uint32_t exponent = bits & 0x7F800000u;
+        if (exponent == 0u)
+            bits &= 0x80000000u;
+        else if (exponent == 0x7F800000u)
+            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+        return std::bit_cast<float>(bits);
+    }
     float normalizeResult(float value, uint32_t &laneFlags) const;
     uint32_t microAddressMask() const;
     int32_t readBranchVi(uint8_t reg) const;
     void recordViWriteForBranch(uint8_t reg, int32_t oldValue);
     void reportReservedInstruction(bool upper, uint32_t instruction);
-    float broadcast(const float *vf, uint8_t bc);
+    float broadcast(const float *vf, uint8_t bc) { return normalizeOperand(vf[bc & 3u]); }
 };
 
 #endif
