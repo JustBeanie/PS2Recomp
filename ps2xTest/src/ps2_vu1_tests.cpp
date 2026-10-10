@@ -5,7 +5,10 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
 
+#include <array>
 #include <cmath>
+#include <cstdio>
+#include <utility>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -217,6 +220,133 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("eager writeback matches the delayed-commit pipeline on random programs", [](TestCase &t)
+        {
+            // setEagerWriteback writes VF/ACC/VI at issue instead of through the
+            // commit queue; readers stall until ready either way, so every program
+            // run to completion must end in the same state, cycle count included.
+            uint32_t seed = 0xC0FFEEu;
+            auto next = [&seed]()
+            {
+                seed = seed * 1664525u + 1013904223u;
+                return seed >> 8;
+            };
+            auto vfReg = [&]() { return static_cast<uint8_t>(1u + next() % 12u); };
+            auto destMask = [&]() { return static_cast<uint8_t>(1u + next() % 15u); };
+            auto randomFloat = [&]() { return static_cast<float>(static_cast<int32_t>(next() % 2001u) - 1000) / 250.0f; };
+
+            uint32_t mismatches = 0u;
+            for (int program = 0; program < 300; ++program)
+            {
+                const uint32_t programSeed = seed;
+                std::vector<std::pair<uint32_t, uint32_t>> pairs; // lower, upper
+                for (int i = 0; i < 24; ++i)
+                {
+                    uint32_t upper = makeVuUpperSpecial(0x2Fu, 0u, 0u, 0u); // NOP
+                    uint32_t lower = 0x8000033Cu;                           // NOP
+                    bool iBit = false;
+                    switch (next() % 14u)
+                    {
+                    case 0: upper = makeVuUpper(static_cast<uint8_t>(0x00u + next() % 4u), destMask(), vfReg(), vfReg(), vfReg()); break; // ADDbc
+                    case 1: upper = makeVuUpper(static_cast<uint8_t>(0x08u + next() % 4u), destMask(), vfReg(), vfReg(), vfReg()); break; // MADDbc
+                    case 2: upper = makeVuUpper(static_cast<uint8_t>(0x18u + next() % 4u), destMask(), vfReg(), vfReg(), vfReg()); break; // MULbc
+                    case 3: upper = makeVuUpper(0x28u, destMask(), vfReg(), vfReg(), vfReg()); break;                                  // ADD
+                    case 4: upper = makeVuUpper(0x2Du, destMask(), vfReg(), vfReg(), vfReg()); break;                                  // MSUB
+                    case 5: upper = makeVuUpper(0x1Cu, destMask(), 0u, vfReg(), vfReg()); break;                                       // MULq
+                    case 6: upper = makeVuUpperSpecial(static_cast<uint8_t>(0x18u + next() % 4u), destMask(), vfReg(), vfReg()); break; // MULAbc
+                    case 7: upper = makeVuUpperSpecial(static_cast<uint8_t>(0x08u + next() % 4u), destMask(), vfReg(), vfReg()); break; // MADDAbc
+                    case 8: upper = makeVuUpperSpecial(0x2Eu, 0xEu, vfReg(), vfReg()); break;                                          // OPMULA
+                    case 9: upper = makeVuUpper(0x2Eu, 0xEu, vfReg(), vfReg(), vfReg()); break;                                        // OPMSUB
+                    case 10: upper = makeVuUpperSpecial(0x15u, destMask(), vfReg(), vfReg()); break;                                   // FTOI4
+                    case 11: upper = makeVuUpper(0x22u, destMask(), 0u, vfReg(), vfReg()); iBit = true; break;                          // ADDi + LOI
+                    default: break;
+                    }
+                    if (iBit)
+                    {
+                        const float imm = randomFloat();
+                        std::memcpy(&lower, &imm, sizeof(lower));
+                        upper |= 0x80000000u;
+                    }
+                    else
+                    {
+                        switch (next() % 11u)
+                        {
+                        case 0: lower = makeVuLq(destMask(), vfReg(), 0u, static_cast<int16_t>(next() % 16u)); break;
+                        case 1: lower = makeVuSq(destMask(), vfReg(), 0u, static_cast<int16_t>(16u + next() % 16u)); break;
+                        case 2: lower = makeVuIaddiu(static_cast<uint8_t>(1u + next() % 4u), static_cast<uint8_t>(next() % 5u), static_cast<int16_t>(next() % 64u)); break;
+                        case 3: lower = makeVuLowerDirect(0x30u, static_cast<uint8_t>(1u + next() % 4u), static_cast<uint8_t>(1u + next() % 4u), static_cast<uint8_t>(1u + next() % 4u)); break; // IADD
+                        case 4: lower = makeVuLowerSpecial(0x30u, vfReg(), vfReg(), 0u, destMask()); break;                    // MOVE
+                        case 5: lower = makeVuLowerSpecial(0x31u, vfReg(), vfReg(), 0u, destMask()); break;                    // MR32
+                        case 6: lower = makeVuLowerSpecial(0x38u, vfReg(), vfReg(), 0u, static_cast<uint8_t>(next() % 16u)); break; // DIV
+                        case 7: lower = makeVuLowerSpecial(0x39u, 0u, vfReg(), 0u, static_cast<uint8_t>(next() % 16u)); break;      // SQRT
+                        case 8: lower = makeVuLowerSpecial(0x3Bu, 0u); break;                                                  // WAITQ
+                        default: break;
+                        }
+                    }
+                    pairs.emplace_back(lower, upper);
+                }
+                pairs.back().second |= 0x40000000u; // E bit
+                pairs.emplace_back(0x8000033Cu, makeVuUpperSpecial(0x2Fu, 0u, 0u, 0u));
+
+                std::array<float, 64> initialData{};
+                for (float &v : initialData)
+                    v = randomFloat();
+                std::array<float, 48> initialVf{};
+                for (float &v : initialVf)
+                    v = randomFloat();
+
+                auto run = [&](bool eager, VU1State &out, std::vector<uint8_t> &dataOut)
+                {
+                    Vu1Fixture fx;
+                    fx.initialize();
+                    for (size_t i = 0; i < pairs.size(); ++i)
+                        writeVuInstructionPair(fx.code, static_cast<uint32_t>(i * 8u), pairs[i].first, pairs[i].second);
+                    std::memcpy(fx.data, initialData.data(), sizeof(initialData));
+                    VU1Interpreter vu1;
+                    vu1.setEagerWriteback(eager);
+                    std::memcpy(&vu1.state().vf[1][0], initialVf.data(), sizeof(initialVf));
+                    vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 100000u);
+                    out = vu1.state();
+                    dataOut.assign(fx.data, fx.data + 512u);
+                };
+                VU1State strict{}, eager{};
+                std::vector<uint8_t> strictData, eagerData;
+                run(false, strict, strictData);
+                run(true, eager, eagerData);
+                const bool same = std::memcmp(strict.vf, eager.vf, sizeof(strict.vf)) == 0 &&
+                                  std::memcmp(strict.vi, eager.vi, sizeof(strict.vi)) == 0 &&
+                                  std::memcmp(strict.acc, eager.acc, sizeof(strict.acc)) == 0 &&
+                                  std::memcmp(&strict.q, &eager.q, sizeof(float)) == 0 &&
+                                  strict.mac == eager.mac && strict.status == eager.status &&
+                                  strict.cycles == eager.cycles && strictData == eagerData;
+                if (!same && mismatches++ < 3u)
+                {
+                    std::printf("  eager/strict mismatch in program %d (seed 0x%08x):", program, programSeed);
+                    for (int r = 0; r < 32; ++r)
+                        for (int c = 0; c < 4; ++c)
+                            if (std::memcmp(&strict.vf[r][c], &eager.vf[r][c], 4) != 0)
+                                std::printf(" vf%d.%c %g/%g", r, "xyzw"[c], strict.vf[r][c], eager.vf[r][c]);
+                    for (int r = 0; r < 16; ++r)
+                        if (strict.vi[r] != eager.vi[r])
+                            std::printf(" vi%d %d/%d", r, strict.vi[r], eager.vi[r]);
+                    if (std::memcmp(strict.acc, eager.acc, sizeof(strict.acc)) != 0)
+                        std::printf(" acc");
+                    if (std::memcmp(&strict.q, &eager.q, 4) != 0)
+                        std::printf(" q %g/%g", strict.q, eager.q);
+                    if (strict.mac != eager.mac || strict.status != eager.status)
+                        std::printf(" flags mac %x/%x status %x/%x", strict.mac, eager.mac, strict.status, eager.status);
+                    if (strict.cycles != eager.cycles)
+                        std::printf(" cycles %llu/%llu", static_cast<unsigned long long>(strict.cycles), static_cast<unsigned long long>(eager.cycles));
+                    if (strictData != eagerData)
+                        std::printf(" data");
+                    std::printf("\n");
+                    for (size_t i = 0; i < pairs.size(); ++i)
+                        std::printf("    %02zx: lower %08x upper %08x\n", i * 8u, pairs[i].first, pairs[i].second);
+                }
+            }
+            t.Equals(mismatches, 0u, "eager writeback must end every program in the strict pipeline's state");
+        });
+
         tc.Run("upper ADD applies the destination mask", [](TestCase &t)
         {
             Vu1Fixture fx;

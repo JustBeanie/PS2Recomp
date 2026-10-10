@@ -54,6 +54,10 @@ public:
     // directly); the runtime enables it for VU1, whose flags only VU1 code reads in
     // practice. PS2X_VU1_EXACT_FLAGS=1 turns it off.
     void setMacStatusFlagElision(bool enabled) { m_flagElisionEnabled = enabled; m_decodedCodeCacheValid = false; }
+    // Write VF/ACC/VI results at issue instead of through the delayed-commit queue.
+    // Programs cannot tell (readers stall until ready); only mid-program inspection
+    // from outside can. Off by default; the runtime enables it for VU1.
+    void setEagerWriteback(bool enabled) { m_eagerWriteback = enabled; }
 
     void execute(uint8_t *vuCode, uint32_t codeSize,
                  uint8_t *vuData, uint32_t dataSize,
@@ -234,6 +238,8 @@ private:
     // flag updates (PCSX2 microVU's flag hack, made exact by the full-memory scan).
     bool m_macStatusFlagsLive = true;
     bool m_flagElisionEnabled = false;
+    bool m_eagerWriteback = false;
+    uint64_t m_eagerWriteHorizon = 0; // latest VF/VI/ACC ready cycle written in place
     bool m_stickyFlagsLive = true;
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};

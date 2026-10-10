@@ -90,6 +90,7 @@ void VU1Interpreter::resetScheduler()
     m_viLatestWrite = {};
     m_accLatestWrite = {};
     m_nextWriteSequence = 0;
+    m_eagerWriteHorizon = 0;
     m_efuResourceReady = 0;
     m_workingClip = m_state.clip;
     m_viBranchBackupValue = 0;
@@ -1031,6 +1032,10 @@ void VU1Interpreter::advanceTo(uint64_t targetCycle)
 
 bool VU1Interpreter::pipelinesPending() const
 {
+    // In eager mode a result is already in place but the unit is still busy until
+    // its ready cycle, as the queued commit would be.
+    if (m_eagerWriteback && m_eagerWriteHorizon > m_cycle)
+        return true;
     return m_fdiv.valid || m_xgkick.active ||
            (m_efuLive | m_flagLive | m_storeLive | m_vfWriteLive | m_viWriteLive | m_accWriteLive) != 0u;
 }
@@ -1097,7 +1102,7 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
         for (uint32_t component = 0; component < 4u; ++component)
         {
             if ((lowerWrite.lanes & laneForComponent(component)) != 0u)
-                m_vfReady[lowerWrite.reg][component] = m_cycle + latency;
+                { m_vfReady[lowerWrite.reg][component] = m_cycle + latency; m_eagerWriteHorizon = std::max(m_eagerWriteHorizon, m_cycle + latency); }
         }
     }
 
@@ -1110,17 +1115,17 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
         for (uint32_t component = 0; component < 4u; ++component)
         {
             if ((upperWrite.lanes & laneForComponent(component)) != 0u)
-                m_vfReady[upperWrite.reg][component] = m_cycle + latency;
+                { m_vfReady[upperWrite.reg][component] = m_cycle + latency; m_eagerWriteHorizon = std::max(m_eagerWriteHorizon, m_cycle + latency); }
         }
     }
 
     const uint32_t viLatency = decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency;
     for (uint32_t viWrite = decoded.lowerUsage.viWrite & 0xFFFEu; viWrite != 0u; viWrite &= viWrite - 1u)
-        m_viReady[static_cast<uint32_t>(std::countr_zero(viWrite))] = m_cycle + viLatency;
+        { m_viReady[static_cast<uint32_t>(std::countr_zero(viWrite))] = m_cycle + viLatency; m_eagerWriteHorizon = std::max(m_eagerWriteHorizon, m_cycle + viLatency); }
     for (uint32_t component = 0; component < 4u; ++component)
     {
         if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
-            m_accReady[component] = m_cycle + kAccForwardLatency;
+            { m_accReady[component] = m_cycle + kAccForwardLatency; m_eagerWriteHorizon = std::max(m_eagerWriteHorizon, m_cycle + kAccForwardLatency); }
     }
 }
 
@@ -1751,8 +1756,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
         const VfAccess upperWrite = decoded.upperUsage.vfWrite;
         const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
-        const bool hasUpperWrite = upperWrite.reg != 0u;
-        const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
+        // Eager writeback (runtime mode): VF, ACC and VI results stay in place at
+        // issue. Every reader of a register with a pending write stalls until its
+        // ready cycle (calculatePairReadyCycle; the hardware interlocks), so the
+        // delayed commit is only visible mid-program to an outside observer, and
+        // markPairWrites still records the stall timing.
+        const bool hasUpperWrite = !m_eagerWriteback && upperWrite.reg != 0u;
+        const bool hasLowerWrite = !m_eagerWriteback && lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
         const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
         float oldUpperVf[4]{};
         float newUpperVf[4]{};
@@ -1764,7 +1774,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
         if (hasDistinctLowerWrite)
             std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
-        if (decoded.upperUsage.accWrite != 0u)
+        const bool queueAcc = !m_eagerWriteback && decoded.upperUsage.accWrite != 0u;
+        if (queueAcc)
             std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
 
         if (decoded.iBit)
@@ -1820,7 +1831,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                                          : decoded.lowerUsage.latency;
             queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
         }
-        if (decoded.upperUsage.accWrite != 0u)
+        if (queueAcc)
         {
             std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
             std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
@@ -1829,7 +1840,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             queueAccWrite(decoded.upperUsage.accWrite, newAcc,
                           kAccForwardLatency);
         }
-        if (writtenVi != 0u)
+        if (writtenVi != 0u && !m_eagerWriteback)
         {
             const int32_t newVi = m_state.vi[writtenVi];
             m_state.vi[writtenVi] = oldVi;

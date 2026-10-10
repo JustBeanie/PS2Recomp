@@ -25,6 +25,7 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include "runtime/ps2_perf_stats.h"
 
@@ -571,6 +572,98 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_hasUploadedFrame = true;
 }
 
+namespace
+{
+    // PS2X_VU1_PROGRAM_STATS=<dir>: per (VU1 code image, start PC) call count, VU
+    // cycles and host time, printed every 20000 MSCALs; each distinct code image is
+    // saved once as <dir>/vu1code_<hash>.bin. Sizes VU1 ahead-of-time compilation.
+    class Vu1ProgramStats
+    {
+    public:
+        static Vu1ProgramStats *instance()
+        {
+            static Vu1ProgramStats *stats = []() -> Vu1ProgramStats *
+            {
+                const char *dir = std::getenv("PS2X_VU1_PROGRAM_STATS");
+                return dir ? new Vu1ProgramStats(dir) : nullptr;
+            }();
+            return stats;
+        }
+
+        void record(const uint8_t *code, uint32_t codeSize, uint64_t generation, uint32_t startPC,
+                    uint64_t cycles, uint64_t nanoseconds)
+        {
+            if (generation != m_generation || code != m_code)
+            {
+                uint64_t hash = 1469598103934665603ull;
+                for (uint32_t i = 0; i < codeSize; ++i)
+                    hash = (hash ^ code[i]) * 1099511628211ull;
+                m_hash = hash;
+                m_generation = generation;
+                m_code = code;
+                if (m_savedImages.insert(hash).second)
+                {
+                    char path[512];
+                    std::snprintf(path, sizeof(path), "%s/vu1code_%016llx.bin", m_dir.c_str(),
+                                  static_cast<unsigned long long>(hash));
+                    if (FILE *f = std::fopen(path, "wb"))
+                    {
+                        std::fwrite(code, 1, codeSize, f);
+                        std::fclose(f);
+                    }
+                }
+            }
+            Entry &entry = m_entries[{m_hash, startPC}];
+            ++entry.calls;
+            entry.cycles += cycles;
+            entry.nanoseconds += nanoseconds;
+            if (++m_total % 20000u == 0u)
+                print();
+        }
+
+    private:
+        struct Entry
+        {
+            uint64_t calls = 0, cycles = 0, nanoseconds = 0;
+        };
+        struct KeyHash
+        {
+            size_t operator()(const std::pair<uint64_t, uint32_t> &k) const { return static_cast<size_t>(k.first ^ (static_cast<uint64_t>(k.second) << 40)); }
+        };
+
+        explicit Vu1ProgramStats(const char *dir) : m_dir(dir) {}
+
+        void print() const
+        {
+            std::vector<std::pair<std::pair<uint64_t, uint32_t>, Entry>> rows(m_entries.begin(), m_entries.end());
+            std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b)
+                      { return a.second.nanoseconds > b.second.nanoseconds; });
+            uint64_t totalNs = 0;
+            for (const auto &row : rows)
+                totalNs += row.second.nanoseconds;
+            std::fprintf(stderr, "[vu1prog] after %llu programs: %zu distinct (image,pc), %zu images, %.1f ms total\n",
+                         static_cast<unsigned long long>(m_total), rows.size(), m_savedImages.size(), totalNs / 1e6);
+            for (size_t i = 0; i < rows.size() && i < 25u; ++i)
+            {
+                const auto &[key, e] = rows[i];
+                std::fprintf(stderr, "[vu1prog]   image=%016llx pc=0x%04x calls=%llu cycles/call=%llu time=%.1f%%\n",
+                             static_cast<unsigned long long>(key.first), key.second,
+                             static_cast<unsigned long long>(e.calls),
+                             static_cast<unsigned long long>(e.calls ? e.cycles / e.calls : 0u),
+                             totalNs ? 100.0 * e.nanoseconds / totalNs : 0.0);
+            }
+        }
+
+        std::string m_dir;
+        const uint8_t *m_code = nullptr;
+        uint64_t m_generation = UINT64_MAX;
+        uint64_t m_hash = 0;
+        uint64_t m_total = 0;
+        std::unordered_set<uint64_t> m_savedImages;
+        std::unordered_map<std::pair<uint64_t, uint32_t>, Entry, KeyHash> m_entries;
+    };
+}
+
 PS2Runtime::PS2Runtime()
 {
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
@@ -777,10 +870,21 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     Vu1ProgramStats *programStats = Vu1ProgramStats::instance();
+                                     const uint64_t statsCycles = m_vu1.state().cycles;
+                                     const auto statsStart = programStats ? std::chrono::steady_clock::now()
+                                                                          : std::chrono::steady_clock::time_point{};
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
                                      runVu1ToCompletion(top, itop);
+                                     if (programStats)
+                                         programStats->record(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                              m_memory.getVU1CodeGeneration(), startPC,
+                                                              m_vu1.state().cycles - statsCycles,
+                                                              static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                                        std::chrono::steady_clock::now() - statsStart)
+                                                                                        .count()));
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -2511,6 +2615,7 @@ void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
     m_vu1.setMacStatusFlagElision(std::getenv("PS2X_VU1_EXACT_FLAGS") == nullptr);
+    m_vu1.setEagerWriteback(std::getenv("PS2X_VU1_EXACT_PIPELINE") == nullptr);
     ps2_stubs::resetSifState();
     resetIop();
     ps2_stubs::resetAudioStubState();
