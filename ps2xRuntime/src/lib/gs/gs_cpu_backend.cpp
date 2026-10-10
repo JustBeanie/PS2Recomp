@@ -2310,6 +2310,14 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
     decodeDisplaySize(request.display1, width1, height1);
     decodeDisplaySize(request.display2, width2, height2);
+    // Interlaced FRAME mode (INT=1, FFMD=1): DISPLAY.DH counts the lines of both
+    // fields, but each field scans every framebuffer row, so the source is half as
+    // tall (PCSX2 halves it the same way). Sly 2: DH=447 over a 224-row buffer.
+    if (smode2.interlaced && smode2.frameMode)
+    {
+        height1 = std::max<uint32_t>(1u, height1 / 2u);
+        height2 = std::max<uint32_t>(1u, height2 / 2u);
+    }
     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
     if (!valid1 && !valid2)
