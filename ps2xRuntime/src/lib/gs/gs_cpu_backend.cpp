@@ -757,8 +757,22 @@ namespace
             for (uint32_t page = first; page <= last && page - first < kVramPages; ++page)
                 fn(page % kVramPages);
         };
-        span(ctx.frame.fbp, ctx.frame.psm);
-        if (!ctx.zbuf.zmask)
+        // What the TEST register lets through: an alpha test that never passes
+        // writes only what AFAIL keeps (KEEP: nothing, FB_ONLY/RGB_ONLY: frame,
+        // ZB_ONLY: Z), and ZTST NEVER writes nothing. Sly 2's 448-row channel
+        // shuffles (alpha NEVER, FB_ONLY) would otherwise mark Z pages far past the
+        // 224-row Z buffer, where its palettes live, and stall every CLUT load.
+        const uint64_t test = ctx.test;
+        const bool alphaNever = (test & 1u) != 0u && ((test >> 1) & 7u) == 0u;
+        const uint32_t afail = static_cast<uint32_t>((test >> 12) & 3u);
+        const bool zNever = ((test >> 16) & 1u) != 0u && ((test >> 17) & 3u) == 0u;
+        if (zNever)
+            return;
+        const bool writesFrame = ctx.frame.fbmsk != 0xFFFFFFFFu && !(alphaNever && (afail == 0u || afail == 2u));
+        const bool writesZ = !ctx.zbuf.zmask && !(alphaNever && afail != 2u);
+        if (writesFrame)
+            span(ctx.frame.fbp, ctx.frame.psm);
+        if (writesZ)
             span(ctx.zbuf.zbp, ctx.zbuf.psm);
     }
 
@@ -794,7 +808,8 @@ void GSCpuBackend::PageSetsFor(const GSDrawState &state, PageSet &written, PageS
     const std::array<uint64_t, 3> writtenKey = {
         (static_cast<uint64_t>(ctx.frame.fbp) << 32) | (static_cast<uint64_t>(ctx.frame.fbw) << 8) | ctx.frame.psm,
         (static_cast<uint64_t>(ctx.zbuf.zbp) << 32) | (static_cast<uint64_t>(ctx.zbuf.psm) << 8) | (ctx.zbuf.zmask ? 1u : 0u),
-        (static_cast<uint64_t>(ctx.scissor.y0) << 16) | ctx.scissor.y1};
+        (static_cast<uint64_t>(ctx.scissor.y0) << 16) | ctx.scissor.y1 |
+            (static_cast<uint64_t>(ctx.test & 0x7F00Fu) << 32) | (static_cast<uint64_t>(ctx.frame.fbmsk == 0xFFFFFFFFu) << 63)};
     if (writtenKey != m_cachedWrittenKey)
     {
         m_cachedWrittenPages.fill(0u);
