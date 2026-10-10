@@ -49,6 +49,11 @@ public:
     explicit VU1Interpreter(Unit unit = Unit::VU1);
 
     void reset();
+    // Let FMAC ops skip MAC/status bookkeeping while no instruction in micro memory
+    // reads those flags. Off by default (tests and VU0 macro code observe flags
+    // directly); the runtime enables it for VU1, whose flags only VU1 code reads in
+    // practice. PS2X_VU1_EXACT_FLAGS=1 turns it off.
+    void setMacStatusFlagElision(bool enabled) { m_flagElisionEnabled = enabled; m_decodedCodeCacheValid = false; }
 
     void execute(uint8_t *vuCode, uint32_t codeSize,
                  uint8_t *vuData, uint32_t dataSize,
@@ -191,6 +196,16 @@ private:
         uint64_t issueCycle = 0;
         bool active = false;
         bool currentTagEop = false;
+
+        // Clears the transfer state but not the 64 KB packet buffer: bytes are
+        // only read back up to copiedBytes, so zeroing it per XGKICK was waste
+        // (~4% of the EE thread in the Sly 2 title scene).
+        void resetState()
+        {
+            sourceAddress = totalBytes = copiedBytes = currentTagEnd = cycleCredit = 0u;
+            issueCycle = 0u;
+            active = currentTagEop = false;
+        }
     };
 
     static constexpr uint32_t kFmacLatency = 4u;
@@ -214,6 +229,12 @@ private:
     uint32_t m_cachedCodeSize = 0;
     uint64_t m_cachedCodeGeneration = 0;
     bool m_decodedCodeCacheValid = false;
+    // False when no word in the current micro memory is an FSEQ/FSAND/FSOR or
+    // FMEQ/FMAND/FMOR: nothing can observe MAC/status, so FMAC ops skip queueing
+    // flag updates (PCSX2 microVU's flag hack, made exact by the full-memory scan).
+    bool m_macStatusFlagsLive = true;
+    bool m_flagElisionEnabled = false;
+    bool m_stickyFlagsLive = true;
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};

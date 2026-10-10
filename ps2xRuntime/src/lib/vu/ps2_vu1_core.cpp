@@ -82,7 +82,7 @@ void VU1Interpreter::resetScheduler()
     m_vfWritePipeline = {};
     m_viWritePipeline = {};
     m_accWritePipeline = {};
-    m_xgkick = {};
+    m_xgkick.resetState();
     m_vfReady = {};
     m_viReady = {};
     m_accReady = {};
@@ -547,7 +547,8 @@ void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
 {
     uint8_t laneFlags[4]{};
     normalizeFmacResult(result, dest, laneFlags);
-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
+    if (m_macStatusFlagsLive)
+        updateFmacFlags(laneFlags, dest, m_stickyFlagsLive ? calculateFmacProductSticky(dest) : 0u);
     applyDest(dst, result, dest);
 }
 
@@ -555,7 +556,8 @@ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
 {
     uint8_t laneFlags[4]{};
     normalizeFmacResult(result, dest, laneFlags);
-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
+    if (m_macStatusFlagsLive)
+        updateFmacFlags(laneFlags, dest, m_stickyFlagsLive ? calculateFmacProductSticky(dest) : 0u);
     applyDestAcc(result, dest);
 }
 
@@ -924,10 +926,15 @@ void VU1Interpreter::progressXgkick()
         }
 
         const uint32_t qwordOffset = m_xgkick.copiedBytes;
-        for (uint32_t i = 0; i < 16u; ++i)
+        const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
+        if (source + 16u <= m_activeVuDataSize)
         {
-            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
-            m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
+            std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + source, 16u);
+        }
+        else
+        {
+            for (uint32_t i = 0; i < 16u; ++i)
+                m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[(source + i) % m_activeVuDataSize];
         }
         m_xgkick.copiedBytes += 16u;
 
@@ -999,7 +1006,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
         return;
 
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
-    m_xgkick = {};
+    m_xgkick.resetState();
     m_xgkick.active = true;
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
@@ -1580,6 +1587,25 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
     // that pair on its next use.
     if (m_cachedVuCode != vuCode || m_cachedMemory != memory || m_cachedCodeSize != codeSize)
         m_decodedPairStamp.fill(0u);
+    // Any lower word that reads MAC or status keeps flag tracking on; only an
+    // FSEQ/FSOR or an FSAND mask covering bits 6-11 can observe the sticky flags
+    // that product overflow/underflow feeds. Immediates after an I-bit can match
+    // by chance; that only keeps more tracking live. (Sly 2's VU1 code reads just
+    // current Z/S with FSAND 0x2/0x3.)
+    m_macStatusFlagsLive = !m_flagElisionEnabled;
+    m_stickyFlagsLive = !m_flagElisionEnabled;
+    for (uint32_t offset = 0; offset + 8u <= codeSize && !(m_macStatusFlagsLive && m_stickyFlagsLive); offset += 8u)
+    {
+        uint32_t lower = 0;
+        std::memcpy(&lower, vuCode + offset, sizeof(lower));
+        const uint32_t opHi = lower >> 25;
+        if (opHi == 0x14u || opHi == 0x16u || opHi == 0x17u ||
+            opHi == 0x18u || opHi == 0x1Au || opHi == 0x1Bu)
+            m_macStatusFlagsLive = true;
+        const uint32_t imm12 = (((lower >> 21) & 0x1u) << 11) | (lower & 0x7FFu);
+        if (opHi == 0x14u || opHi == 0x17u || (opHi == 0x16u && (imm12 & 0xFC0u) != 0u))
+            m_stickyFlagsLive = true;
+    }
     m_cachedVuCode = vuCode;
     m_cachedMemory = memory;
     m_cachedCodeSize = codeSize;

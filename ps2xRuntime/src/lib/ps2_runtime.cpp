@@ -2510,6 +2510,7 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
+    m_vu1.setMacStatusFlagElision(std::getenv("PS2X_VU1_EXACT_FLAGS") == nullptr);
     ps2_stubs::resetSifState();
     resetIop();
     ps2_stubs::resetAudioStubState();
