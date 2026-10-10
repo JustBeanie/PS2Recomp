@@ -733,19 +733,11 @@ namespace ps2_stubs
                     }
                     else
                     {
-                        const std::filesystem::path queryHostPath = guestMcPathToHostPath(port, guestQuery);
-                        std::error_code queryEc;
-                        if (std::filesystem::exists(queryHostPath, queryEc) && !queryEc &&
-                            std::filesystem::is_directory(queryHostPath, queryEc))
-                        {
-                            parentRel = queryRel;
-                            pattern = "*";
-                        }
-                        else
-                        {
-                            parentRel = queryRel.parent_path();
-                            pattern = queryRel.filename().string();
-                        }
+                        // Without a wildcard the query names one entry: "/SAVE" returns the
+                        // SAVE directory itself (games use it to check a save exists);
+                        // listing its contents takes "/SAVE/*".
+                        parentRel = queryRel.parent_path();
+                        pattern = queryRel.filename().string();
                     }
 
                     if (pattern.empty())
@@ -821,9 +813,11 @@ namespace ps2_stubs
                             entries.push_back(tableEntry);
                         }
 
+                        // maxent <= 0 (Sly 2 passes -1) only counts matches: report how
+                        // many there are without writing a table of unknown size.
                         const size_t entryCount =
-                            std::min(entries.size(), maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
-                        if (entryCount == 0u || tableAddr == 0u)
+                            std::min(entries.size(), maxEntries > 0 ? static_cast<size_t>(maxEntries) : entries.size());
+                        if (maxEntries <= 0 || entryCount == 0u || tableAddr == 0u)
                         {
                             result = static_cast<int32_t>(entryCount);
                         }
