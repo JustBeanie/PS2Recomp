@@ -55,6 +55,7 @@ private:
     void KickPendingDraws();
     void WaitForDraws();
     void DrainDraws();
+    const uint16_t *CurrentClutSnapshot();
     bool DrawConflictsWithPending(const GSDrawState &state) const;
     void MarkPendingAccess(const GSDrawState &state);
 
@@ -96,6 +97,11 @@ private:
     std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
     std::array<uint16_t, 512> m_clut{};
+    // Immutable copies of m_clut handed to queued draws (GSDrawState::clut). A new
+    // copy is made only when the CLUT changed since the last draw; all but the
+    // newest are freed when the queue drains.
+    std::vector<std::unique_ptr<std::array<uint16_t, 512>>> m_clutSnapshots;
+    bool m_clutDirty = true;
     std::array<uint32_t, 2> m_clutCbp{};
     GSMem::TexturePageCache m_texturePageCache;
 

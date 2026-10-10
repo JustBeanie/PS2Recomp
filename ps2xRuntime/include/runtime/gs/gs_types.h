@@ -247,6 +247,12 @@ struct GSDrawState
     uint16_t textureWidth = 1;
     uint16_t textureHeight = 1;
     bool linearFilter = false;
+    // Palette this draw samples, captured when it was queued (owned by the backend).
+    // Lets the GS load the next CLUT without waiting for queued draws to finish.
+    const uint16_t *clut = nullptr;
+    // TEXFLUSH count when queued: a raster worker drops its decoded texture pages
+    // before the first draw with a newer epoch.
+    uint64_t textureEpoch = 0;
 };
 
 struct GSPrimitiveBatch

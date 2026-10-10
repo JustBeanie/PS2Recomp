@@ -659,7 +659,6 @@ void GSCpuBackend::WorkerMain(uint32_t index)
     uint64_t seenGeneration = 0;
     for (;;)
     {
-        uint64_t epoch = 0;
         {
             std::unique_lock<std::mutex> lock(m_workMutex);
             m_workCv.wait(lock, [&]()
@@ -667,16 +666,17 @@ void GSCpuBackend::WorkerMain(uint32_t index)
             if (m_stopWorkers)
                 return;
             seenGeneration = m_workGeneration;
-            epoch = m_textureCacheEpoch;
         }
 
-        if (self.textureCacheEpoch != epoch)
-        {
-            self.textureCache.Invalidate();
-            self.textureCacheEpoch = epoch;
-        }
         for (const GSPrimitiveBatch &batch : m_activeDraws)
+        {
+            if (self.textureCacheEpoch != batch.state.textureEpoch)
+            {
+                self.textureCache.Invalidate();
+                self.textureCacheEpoch = batch.state.textureEpoch;
+            }
             DrawPrimitive(batch);
+        }
 
         {
             std::lock_guard<std::mutex> lock(m_workMutex);
@@ -720,6 +720,19 @@ void GSCpuBackend::DrainDraws()
     WaitForDraws();
     m_pendingWritePages.fill(0u);
     m_pendingReadPages.fill(0u);
+    // No queued draw references a CLUT snapshot any more; keep only the newest.
+    if (m_clutSnapshots.size() > 1u)
+        m_clutSnapshots.erase(m_clutSnapshots.begin(), m_clutSnapshots.end() - 1);
+}
+
+const uint16_t *GSCpuBackend::CurrentClutSnapshot()
+{
+    if (m_clutDirty || m_clutSnapshots.empty())
+    {
+        m_clutSnapshots.push_back(std::make_unique<std::array<uint16_t, 512>>(m_clut));
+        m_clutDirty = false;
+    }
+    return m_clutSnapshots.back()->data();
 }
 
 namespace
@@ -808,6 +821,7 @@ void GSCpuBackend::Reset()
 void GSCpuBackend::ResetUnlocked()
 {
     m_clut.fill(0u);
+    m_clutDirty = true;
     m_clutCbp.fill(0u);
     m_texturePageCache.Invalidate();
     m_transfer = {};
@@ -829,6 +843,9 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         DrawPrimitive(batch);
         return;
     }
+    const bool indexed = batch.state.prim.tme &&
+                         (isFourBitIndexedPsm(batch.state.context.tex0.psm) ||
+                          isEightBitIndexedPsm(batch.state.context.tex0.psm));
     // Workers run each draw band by band, so a draw that samples pages queued draws
     // still write (render-to-texture), or writes pages queued draws still sample,
     // would see other bands half done. Wait for the queue first.
@@ -838,6 +855,9 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 
     constexpr size_t kDrawBatchSize = 128u;
     m_pendingDraws.push_back(batch);
+    m_pendingDraws.back().state.textureEpoch = m_textureCacheEpoch;
+    if (indexed)
+        m_pendingDraws.back().state.clut = CurrentClutSnapshot();
     if (m_pendingDraws.size() >= kDrawBatchSize)
         KickPendingDraws();
 }
@@ -845,7 +865,14 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    DrainDraws();
+    // Queued draws carry their own CLUT snapshot, so a load only has to wait when a
+    // queued draw still writes the VRAM the palette is read from (render-to-CLUT).
+    // A CLUT spans at most 1 KB (256 x 32-bit): the page holding cbp and the next.
+    {
+        const uint32_t page = (tex0.cbp >> 5) % kVramPages;
+        if (pageSetHas(m_pendingWritePages, page) || pageSetHas(m_pendingWritePages, (page + 1u) % kVramPages))
+            DrainDraws();
+    }
     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
         return;
 
@@ -878,6 +905,7 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
     }
 
     LoadClutUnlocked(tex0, texclut);
+    m_clutDirty = true;
 }
 
 void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
@@ -937,10 +965,12 @@ void GSCpuBackend::Flush()
 void GSCpuBackend::TextureFlush()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    // TEXFLUSH: draws queued before it must land in VRAM before anything samples it.
-    DrainDraws();
+    // TEXFLUSH: later draws must not sample stale decoded texture pages. Each queued
+    // draw carries the epoch it was issued in and a worker drops its page cache
+    // before the first draw of a newer epoch. A draw that samples pages a queued
+    // draw still writes already drains in Submit (DrawConflictsWithPending), so
+    // nothing here has to block the EE; Sly 2 issues TEXFLUSH for nearly every draw.
     m_texturePageCache.Invalidate();
-    std::lock_guard<std::mutex> workLock(m_workMutex);
     ++m_textureCacheEpoch;
 }
 
@@ -1482,21 +1512,22 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
         clutIndex = block + (sourceIndex & 0x0Fu);
     }
 
+    const uint16_t *clut = state.clut ? state.clut : m_clut.data();
     switch (cpsm)
     {
     case GS_PSM_CT32:
     {
-        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
+        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
         return applyTexa(state.texa, cpsm, raw);
     }
     case GS_PSM_CT24:
     {
-        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
+        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
         return applyTexa(state.texa, cpsm, raw & 0x00FFFFFFu);
     }
     case GS_PSM_CT16:
     case GS_PSM_CT16S:
-        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(m_clut[clutIndex]));
+        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(clut[clutIndex]));
     default:
         break;
     }
